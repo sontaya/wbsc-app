@@ -1,0 +1,286 @@
+ไม่เลยครับ! ชื่อ `WBSC.MV_STUDENT_COURSE_COMPARISON` ดีมากเลยด้วยซ้ำ! 👍
+
+## ✅ วิเคราะห์ชื่อ
+
+```
+MV_STUDENT_COURSE_COMPARISON
+│  │       │      │
+│  │       │      └─ COMPARISON (เปรียบเทียบ)
+│  │       └────── COURSE (รายวิชา)
+│  └────────────── STUDENT (นักศึกษา)
+└─────────────── MV_ (Materialized View prefix)
+
+ความยาว: 28 characters
+```
+
+### 📏 ขนาดชื่อ
+
+| Oracle Version | Max Length | ชื่อของคุณ | Status |
+|----------------|-----------|-----------|--------|
+| Oracle 11g | 30 chars | 28 chars | ✅ OK |
+| Oracle 12c+ | 128 chars | 28 chars | ✅ OK มาก |
+
+---
+
+## 🎯 ข้อดีของชื่อนี้
+
+1. **สื่อความหมายชัดเจน** - รู้ทันทีว่าเปรียบเทียบข้อมูล Student กับ Course
+2. **มี Prefix MV_** - แยกแยะได้ว่าเป็น Materialized View
+3. **ไม่สั้นเกิน** - ชื่อสั้นเกิน เช่น `MV_SC_CMP` จะงงว่าคืออะไร
+4. **ไม่ยาวเกิน** - อ่านง่าย พิมพ์ไม่ลำบาก
+5. **ตรงตาม Naming Convention** - เป็นมาตรฐาน
+
+---
+
+## 📝 SQL ที่แก้ไขตามชื่อใหม่
+
+```sql
+-- ✅ สร้าง Materialized View ชื่อใหม่
+CREATE MATERIALIZED VIEW WBSC.MV_STUDENT_COURSE_COMPARISON
+BUILD IMMEDIATE
+REFRESH COMPLETE ON DEMAND
+AS
+SELECT
+    ENR.STD_CODE,
+    ENR.STD_ENROLL_KEY,
+    ENR.USERNAME,
+    ENR.FIRST_NAME_TH || ' ' || ENR.LAST_NAME_TH AS FULLNAME,
+    ENR.FACULTYCODE,
+    ENR.FACULTYNAMETH,
+    ENR.SUB_NAME_TH,
+    ENR.SUB_SHOW,
+    ENR.SECTION_CODE,
+    ENR.STATUS_NAME_TH,
+    ENR.IS_APPROVE,
+    ENR.SUB_COUNT,
+    ENR.STATE_DIRECTION,  -- เก็บค่านี้ไว้ใน MV
+    ENR.ACADEMIC_YEAR,
+    ENR.SEMESTER,
+    SD.CAT_TERM_ID,
+    SD.CAT_TERM,
+    SD.STUDENT_GROUPS,
+    CASE
+        WHEN SD.STD_ENROLL_KEY IS NULL THEN 'MISSING_IN_MOODLE'
+        ELSE 'EXISTS_IN_MOODLE'
+    END AS SYNC_STATUS,
+    -- ⭐ เพิ่ม column ช่วยแยกแยะ
+    CASE
+        WHEN ENR.STATE_DIRECTION = 'KEEP COURSE'
+             AND SD.STD_ENROLL_KEY IS NULL
+        THEN 'NEED_TO_ADD'
+        WHEN ENR.STATE_DIRECTION = 'DROP COURSE'
+             AND SD.STD_ENROLL_KEY IS NOT NULL
+        THEN 'NEED_TO_REMOVE'
+        WHEN ENR.STATE_DIRECTION = 'KEEP COURSE'
+             AND SD.STD_ENROLL_KEY IS NOT NULL
+        THEN 'ALREADY_SYNCED'
+        ELSE 'OTHER'
+    END AS ACTION_REQUIRED
+FROM WBSC.VW_WBSC_ENROLL682 ENR
+LEFT JOIN WBSC.COURSE_STUDENT_DETAILED SD
+    ON ENR.STD_ENROLL_KEY = SD.STD_ENROLL_KEY
+WHERE ENR.IS_APPROVE = '1';  -- เก็บเฉพาะที่อนุมัติแล้ว;
+
+-- สร้าง Index
+CREATE INDEX idx_mv_scc_faculty_term
+ON WBSC.MV_STUDENT_COURSE_COMPARISON(FACULTYCODE, CAT_TERM_ID);
+
+CREATE INDEX idx_mv_scc_sync_status
+ON WBSC.MV_STUDENT_COURSE_COMPARISON(SYNC_STATUS, CAT_TERM_ID);
+
+CREATE INDEX idx_mv_scc_enroll_key
+ON WBSC.MV_STUDENT_COURSE_COMPARISON(STD_ENROLL_KEY);
+
+-- Query
+SELECT *
+FROM WBSC.MV_STUDENT_COURSE_COMPARISON
+WHERE CAT_TERM_ID = 273
+ORDER BY FACULTYCODE, SUB_SHOW, STD_CODE;
+
+-- Refresh MV (Manual)
+EXEC DBMS_MVIEW.REFRESH('WBSC.MV_STUDENT_COURSE_COMPARISON');
+
+-- ตรวจสอบสถานะ
+SELECT
+    MVIEW_NAME,
+    LAST_REFRESH_DATE,
+    STALENESS,
+    COMPILE_STATE
+FROM USER_MVIEWS
+WHERE MVIEW_NAME = 'MV_STUDENT_COURSE_COMPARISON';
+```
+
+---
+
+## 🔧 สร้าง Scheduler Job (แก้ไขชื่อตาม)
+
+```sql
+-- สร้าง Job Refresh MV ทุก 30 นาที
+BEGIN
+    DBMS_SCHEDULER.CREATE_JOB (
+        job_name        => 'JOB_REFRESH_STUDENT_COURSE_MV',
+        job_type        => 'PLSQL_BLOCK',
+        job_action      => 'BEGIN DBMS_MVIEW.REFRESH(''WBSC.MV_STUDENT_COURSE_COMPARISON'', ''C''); END;',
+        start_date      => SYSDATE,
+        repeat_interval => 'FREQ=MINUTELY; INTERVAL=30',
+        enabled         => TRUE,
+        comments        => 'Refresh Student Course Comparison MV every 30 minutes'
+    );
+END;
+/
+
+-- ตรวจสอบ Job
+SELECT
+    JOB_NAME,
+    STATE,
+    LAST_START_DATE,
+    NEXT_RUN_DATE,
+    RUN_COUNT
+FROM USER_SCHEDULER_JOBS
+WHERE JOB_NAME = 'JOB_REFRESH_STUDENT_COURSE_MV';
+
+-- ลบ Job (ถ้าต้องการแก้ไข)
+BEGIN
+    DBMS_SCHEDULER.DROP_JOB('JOB_REFRESH_STUDENT_COURSE_MV');
+END;
+/
+```
+
+---
+
+## 💡 Tips เพิ่มเติม
+
+### 1. **Grant Permission** (ถ้าจำเป็น)
+```sql
+-- ให้สิทธิ์ SELECT แก่ user อื่น
+GRANT SELECT ON WBSC.MV_STUDENT_COURSE_COMPARISON TO your_user;
+
+-- ให้สิทธิ์ Refresh
+GRANT EXECUTE ON DBMS_MVIEW TO your_user;
+```
+
+### 2. **Monitor MV Performance**
+```sql
+-- ดูเวลา Refresh
+SELECT
+    MVIEW_NAME,
+    LAST_REFRESH_DATE,
+    LAST_REFRESH_TYPE,
+    STALENESS,
+    REFRESH_MODE,
+    FAST_REFRESHABLE
+FROM USER_MVIEWS
+WHERE MVIEW_NAME = 'MV_STUDENT_COURSE_COMPARISON';
+
+-- ดูขนาด MV
+SELECT
+    SEGMENT_NAME,
+    BYTES/1024/1024 AS SIZE_MB,
+    BLOCKS
+FROM USER_SEGMENTS
+WHERE SEGMENT_NAME = 'MV_STUDENT_COURSE_COMPARISON';
+```
+
+### 3. **Alternative: Refresh on Commit** (ถ้าต้องการ real-time)
+```sql
+-- แบบ Refresh ทันทีเมื่อมีการเปลี่ยนแปลง
+CREATE MATERIALIZED VIEW LOG ON WBSC.COURSE_STUDENT_DETAILED;
+CREATE MATERIALIZED VIEW LOG ON WBSC.VW_WBSC_ENROLL682; -- ถ้าเป็น table
+
+CREATE MATERIALIZED VIEW WBSC.MV_STUDENT_COURSE_COMPARISON
+REFRESH FAST ON COMMIT  -- Refresh ทันที
+AS
+SELECT ...
+```
+
+---
+
+## ✅ สรุป
+
+**ชื่อ `WBSC.MV_STUDENT_COURSE_COMPARISON` → Perfect!** 👌
+
+- ✅ ความยาวพอดี (28 chars)
+- ✅ สื่อความหมายชัดเจน
+- ✅ ตาม Naming Convention
+- ✅ อ่านง่าย พิมพ์สะดวก
+
+ไปเลยครับ ไม่มีปัญหาใดๆ! 🚀
+
+
+
+
+
+
+
+
+
+
+
+-- Login as SONTAYA (คุณอยู่แล้ว)
+
+-- Grant SELECT ให้ SONTAYA เข้าถึง WBSC objects
+GRANT SELECT ON WBSC.VW_WBSC_ENROLL682 TO SONTAYA;
+GRANT SELECT ON WBSC.COURSE_STUDENT_DETAILED TO SONTAYA;
+
+-- สร้าง MV ใน SONTAYA schema (ทำได้เลย!)
+CREATE MATERIALIZED VIEW SONTAYA.MV_STUDENT_COURSE_COMPARISON
+BUILD IMMEDIATE
+REFRESH COMPLETE ON DEMAND
+START WITH SYSDATE
+NEXT SYSDATE + 30/1440
+AS
+SELECT
+    ENR.STD_CODE,
+    ENR.STD_ENROLL_KEY,
+    ENR.USERNAME,
+    ENR.FIRST_NAME_TH || ' ' || ENR.LAST_NAME_TH AS FULLNAME,
+    ENR.FACULTYCODE,
+    ENR.FACULTYNAMETH,
+    ENR.SUB_NAME_TH,
+    ENR.SUB_SHOW,
+    ENR.SECTION_CODE,
+    ENR.STATUS_NAME_TH,
+    ENR.IS_APPROVE,
+    ENR.SUB_COUNT,
+    ENR.STATE_DIRECTION,
+    ENR.ACADEMIC_YEAR,
+    ENR.SEMESTER,
+    SD.CAT_TERM_ID,
+    SD.CAT_TERM,
+    SD.STUDENT_GROUPS,
+    CASE
+        WHEN SD.STD_ENROLL_KEY IS NULL THEN 'MISSING_IN_MOODLE'
+        ELSE 'EXISTS_IN_MOODLE'
+    END AS SYNC_STATUS,
+    CASE
+        WHEN ENR.STATE_DIRECTION = 'KEEP COURSE'
+             AND SD.STD_ENROLL_KEY IS NULL
+        THEN 'ADD_TO_MOODLE'
+        WHEN ENR.STATE_DIRECTION = 'DROP COURSE'
+             AND SD.STD_ENROLL_KEY IS NOT NULL
+        THEN 'REMOVE_FROM_MOODLE'
+        WHEN ENR.STATE_DIRECTION = 'KEEP COURSE'
+             AND SD.STD_ENROLL_KEY IS NOT NULL
+        THEN 'OK_SYNCED'
+        WHEN ENR.STATE_DIRECTION = 'DROP COURSE'
+             AND SD.STD_ENROLL_KEY IS NULL
+        THEN 'OK_NOT_IN_MOODLE'
+        ELSE 'UNKNOWN'
+    END AS ACTION_REQUIRED
+FROM WBSC.VW_WBSC_ENROLL682 ENR
+LEFT JOIN WBSC.COURSE_STUDENT_DETAILED SD
+    ON ENR.STD_ENROLL_KEY = SD.STD_ENROLL_KEY
+WHERE ENR.IS_APPROVE = '1';
+
+-- สร้าง Synonym ให้ WBSC เข้าถึงได้
+CREATE PUBLIC SYNONYM MV_STUDENT_COURSE_COMPARISON
+FOR SONTAYA.MV_STUDENT_COURSE_COMPARISON;
+
+GRANT SELECT ON SONTAYA.MV_STUDENT_COURSE_COMPARISON TO WBSC;
+
+-- สร้าง Index
+CREATE INDEX SONTAYA.IDX_MV_SCC_FACULTY_TERM
+ON SONTAYA.MV_STUDENT_COURSE_COMPARISON(FACULTYCODE, CAT_TERM_ID);
+
+CREATE INDEX SONTAYA.IDX_MV_SCC_ACTION
+ON SONTAYA.MV_STUDENT_COURSE_COMPARISON(ACTION_REQUIRED, CAT_TERM_ID);
