@@ -1,0 +1,1405 @@
+# ระบบบริหารจัดการการเพิ่มถอนรายวิชา Moodle LMS
+
+## 📋 ภาพรวมระบบ
+
+ระบบนี้ทำหน้าที่เชื่อมต่อระหว่าง Oracle Database (ระบบทะเบียน) กับ Moodle LMS โดยอัตโนมัติ เพื่อจัดการการเพิ่ม/ถอนรายวิชาของนักศึกษาให้ตรงกับข้อมูลการลงทะเบียนจริง
+
+### เทคโนโลยีที่ใช้
+- **Backend**: CodeIgniter 4 + PHP 8.3
+- **Database**: MariaDB (Moodle) + Oracle 11g (Source)
+- **Server**: Apache + Docker
+- **Moodle Plugin**: Flat file (CSV) enrolment
+
+---
+
+## 🗄️ Database Schema
+
+### 1. ตาราง Master Data ใน Moodle Database
+
+```sql
+-- ตารางหลักเก็บสถานะการลงทะเบียน
+CREATE TABLE mdl_enrol_oracle_sync (
+    id BIGINT(10) AUTO_INCREMENT PRIMARY KEY,
+    user_idnumber VARCHAR(100) NOT NULL COMMENT 'รหัสนักศึกษา',
+    course_idnumber VARCHAR(100) NOT NULL COMMENT 'รหัสวิชา',
+    semester VARCHAR(20) NOT NULL COMMENT 'ภาคการศึกษา เช่น 1/2567',
+    status ENUM('active', 'inactive') DEFAULT 'active',
+    enrol_method VARCHAR(50) DEFAULT 'flatfile',
+
+    -- ข้อมูลเพิ่มเติมจาก Oracle
+    student_name VARCHAR(255),
+    course_name VARCHAR(255),
+    section VARCHAR(50),
+    credit DECIMAL(3,2),
+
+    -- Tracking
+    first_sync_date DATETIME NOT NULL,
+    last_sync_date DATETIME NOT NULL,
+    last_action VARCHAR(20) COMMENT 'add, del, skip',
+    sync_count INT DEFAULT 1,
+
+    -- Audit
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- Indexes
+    UNIQUE KEY uk_user_course_semester (user_idnumber, course_idnumber, semester),
+    INDEX idx_status (status),
+    INDEX idx_user (user_idnumber),
+    INDEX idx_course (course_idnumber),
+    INDEX idx_semester (semester),
+    INDEX idx_last_sync (last_sync_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ตารางเก็บประวัติการ Sync
+CREATE TABLE mdl_enrol_oracle_sync_log (
+    id BIGINT(10) AUTO_INCREMENT PRIMARY KEY,
+    sync_datetime DATETIME NOT NULL,
+    sync_type VARCHAR(20) NOT NULL COMMENT 'manual, scheduled',
+    semester VARCHAR(20) NOT NULL,
+
+    -- สถิติ
+    total_records INT DEFAULT 0,
+    new_enrolls INT DEFAULT 0,
+    removed_enrolls INT DEFAULT 0,
+    unchanged INT DEFAULT 0,
+    errors INT DEFAULT 0,
+
+    -- Performance
+    execution_time DECIMAL(10,2) COMMENT 'วินาที',
+    csv_file_path VARCHAR(500),
+    csv_file_size INT COMMENT 'bytes',
+
+    -- Status
+    status ENUM('running', 'completed', 'failed', 'partial') DEFAULT 'running',
+    error_message TEXT,
+
+    -- User
+    triggered_by VARCHAR(100),
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_sync_datetime (sync_datetime),
+    INDEX idx_semester (semester),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ตารางเก็บรายละเอียด Error
+CREATE TABLE mdl_enrol_oracle_sync_errors (
+    id BIGINT(10) AUTO_INCREMENT PRIMARY KEY,
+    sync_log_id BIGINT(10) NOT NULL,
+    user_idnumber VARCHAR(100),
+    course_idnumber VARCHAR(100),
+    error_type VARCHAR(50) COMMENT 'user_not_found, course_not_found, db_error, etc',
+    error_message TEXT,
+    error_data JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (sync_log_id) REFERENCES mdl_enrol_oracle_sync_log(id) ON DELETE CASCADE,
+    INDEX idx_sync_log (sync_log_id),
+    INDEX idx_error_type (error_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ตารางเก็บ Configuration
+CREATE TABLE mdl_enrol_oracle_sync_config (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    config_key VARCHAR(100) UNIQUE NOT NULL,
+    config_value TEXT,
+    description TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    updated_by VARCHAR(100)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Insert default config
+INSERT INTO mdl_enrol_oracle_sync_config (config_key, config_value, description) VALUES
+('oracle_view_name', 'V_STUDENT_ENROLLMENT', 'ชื่อ View ใน Oracle'),
+('csv_file_path', '/VolFreenas/wbsc2021/moodledata/enroll_files/sync-data.csv', 'ที่อยู่ไฟล์ CSV'),
+('csv_delimiter', ',', 'ตัวคั่นใน CSV'),
+('default_role', 'student', 'Role เริ่มต้น'),
+('auto_sync_enabled', '1', 'เปิด/ปิดการ sync อัตโนมัติ'),
+('sync_schedule', '0 2 * * *', 'Cron expression (2:00 AM ทุกวัน)'),
+('current_semester', '1/2568', 'ภาคการศึกษาปัจจุบัน'),
+('batch_size', '1000', 'จำนวนรายการต่อ batch'),
+('enable_email_notification', '1', 'ส่งอีเมลแจ้งเตือน'),
+('admin_email', 'admin@example.com', 'อีเมลผู้ดูแล');
+```
+
+### 2. Oracle View Structure (ตัวอย่าง)
+
+```sql
+-- สมมติว่า Oracle View มีโครงสร้างประมาณนี้
+-- V_STUDENT_ENROLLMENT
+SELECT
+    STUDENT_ID as user_idnumber,
+    COURSE_CODE as course_idnumber,
+    SEMESTER,
+    STUDENT_NAME,
+    COURSE_NAME,
+    SECTION,
+    CREDIT,
+    STATUS, -- 'E' = Enrolled, 'W' = Withdrawn
+    ENROLL_DATE,
+    LAST_UPDATE
+FROM REGISTRATION_TABLE
+WHERE STATUS = 'E'
+AND SEMESTER = '1/2568';
+```
+
+---
+
+## 🏗️ System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Admin Dashboard                          │
+│                    (CodeIgniter 4 - MVC)                       │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │   Sync       │  │   Reports    │  │   Config     │        │
+│  │   Manager    │  │   Viewer     │  │   Manager    │        │
+│  └──────────────┘  └──────────────┘  └──────────────┘        │
+└────────────┬────────────────────────────────────────────────────┘
+             │
+             ├─────────────────┐
+             │                 │
+             ▼                 ▼
+┌────────────────────┐  ┌──────────────────────┐
+│  Oracle Service    │  │   Moodle Service     │
+│  - Connect Oracle  │  │   - Manage Master DB │
+│  - Fetch Data      │  │   - Generate CSV     │
+│  - Parse Result    │  │   - Execute Plugin   │
+└────────┬───────────┘  └──────────┬───────────┘
+         │                         │
+         │                         │
+         ▼                         ▼
+┌──────────────────┐      ┌──────────────────┐
+│   Oracle 11g     │      │  MariaDB/Moodle  │
+│   (View)         │      │  (Master Data)   │
+└──────────────────┘      └──────────────────┘
+                                   │
+                                   ▼
+                          ┌──────────────────┐
+                          │  Flat File CSV   │
+                          │  + Moodle Task   │
+                          └──────────────────┘
+```
+
+---
+
+## 📂 CodeIgniter 4 Project Structure
+
+```
+wbsc-app/
+├── app/
+│   ├── Config/
+│   │   ├── Routes.php
+│   │   ├── Database.php (Oracle + Moodle connections)
+│   │   └── MoodleSync.php (Custom config)
+│   │
+│   ├── Controllers/
+│   │   ├── Admin/
+│   │   │   ├── SyncController.php
+│   │   │   ├── ReportController.php
+│   │   │   └── ConfigController.php
+│   │   └── Api/
+│   │       └── SyncApiController.php
+│   │
+│   ├── Models/
+│   │   ├── EnrolOracleSyncModel.php
+│   │   ├── EnrolOracleSyncLogModel.php
+│   │   ├── EnrolOracleSyncErrorModel.php
+│   │   └── EnrolOracleSyncConfigModel.php
+│   │
+│   ├── Libraries/
+│   │   ├── OracleService.php
+│   │   ├── MoodleEnrolService.php
+│   │   ├── CsvGenerator.php
+│   │   └── NotificationService.php
+│   │
+│   ├── Commands/
+│   │   └── SyncEnrolment.php (CLI Command)
+│   │
+│   ├── Views/
+│   │   ├── admin/
+│   │   │   ├── sync/
+│   │   │   │   ├── index.php
+│   │   │   │   ├── history.php
+│   │   │   │   └── manual_sync.php
+│   │   │   ├── reports/
+│   │   │   │   ├── dashboard.php
+│   │   │   │   ├── by_course.php
+│   │   │   │   └── by_user.php
+│   │   │   └── config/
+│   │   │       └── settings.php
+│   │   └── layouts/
+│   │       └── admin_layout.php
+│   │
+│   └── Helpers/
+│       └── moodle_helper.php
+│
+├── public/
+│   ├── assets/
+│   │   ├── css/
+│   │   │   └── admin.css
+│   │   └── js/
+│   │       └── sync-manager.js
+│   └── index.php
+│
+├── writable/
+│   ├── logs/
+│   │   └── sync-*.log
+│   └── uploads/
+│       └── sync-data-*.csv
+│
+└── .env
+```
+
+---
+
+## 🔄 Data Flow & Process
+
+### 1. Sync Process Flow
+
+```
+START
+  │
+  ├─→ [1] เชื่อมต่อ Oracle DB
+  │        │
+  │        ├─→ ดึงข้อมูลจาก View (ภาคการศึกษาปัจจุบัน)
+  │        └─→ จัดเก็บข้อมูลชั่วคราว
+  │
+  ├─→ [2] เชื่อมต่อ Moodle DB
+  │        │
+  │        └─→ ดึงข้อมูล Master Data ที่มีอยู่
+  │
+  ├─→ [3] เปรียบเทียบข้อมูล
+  │        │
+  │        ├─→ ระบุรายการที่ต้อง ADD (มีใน Oracle ไม่มีใน Moodle)
+  │        ├─→ ระบุรายการที่ต้อง DEL (มีใน Moodle ไม่มีใน Oracle)
+  │        └─→ ระบุรายการที่ไม่เปลี่ยนแปลง
+  │
+  ├─→ [4] อัพเดท Master Data
+  │        │
+  │        ├─→ INSERT รายการใหม่ (status = active)
+  │        ├─→ UPDATE รายการเดิม (status = inactive)
+  │        └─→ บันทึก Log
+  │
+  ├─→ [5] สร้างไฟล์ CSV
+  │        │
+  │        ├─→ Format: operation,role,user_idnumber,course_idnumber
+  │        ├─→ บันทึกไฟล์: /VolFreenas/.../sync-data.csv
+  │        └─→ Validate ไฟล์
+  │
+  ├─→ [6] Execute Moodle Task
+  │        │
+  │        └─→ php74 scheduled_task.php --execute='\enrol_flatfile\task\flatfile_sync_task'
+  │
+  ├─→ [7] บันทึกผลลัพธ์
+  │        │
+  │        ├─→ อัพเดท Sync Log
+  │        ├─→ บันทึก Errors (ถ้ามี)
+  │        └─→ ส่งอีเมลแจ้งเตือน (ถ้าเปิดใช้)
+  │
+END
+```
+
+### 2. Business Logic
+
+```php
+// Pseudo Code for Sync Logic
+
+foreach (Oracle Records as $oracleRecord) {
+    $key = $oracleRecord->user_idnumber . '_' . $oracleRecord->course_idnumber;
+    $masterRecord = MasterData[$key] ?? null;
+
+    if (!$masterRecord) {
+        // กรณีที่ 1: มีใน Oracle แต่ไม่มีใน Master
+        → INSERT Master Data (status = 'active')
+        → Add to CSV (operation = 'add')
+
+    } elseif ($masterRecord->status == 'inactive') {
+        // กรณีที่ 2: เคยถอนแล้ว แต่ลงทะเบียนใหม่
+        → UPDATE Master Data (status = 'active')
+        → Add to CSV (operation = 'add')
+
+    } else {
+        // กรณีที่ 3: ไม่มีการเปลี่ยนแปลง
+        → UPDATE last_sync_date only
+        → Skip CSV
+    }
+}
+
+// ตรวจสอบรายการที่ถูกถอน
+foreach (MasterData as $masterRecord) {
+    if ($masterRecord->status == 'active') {
+        $key = $masterRecord->user_idnumber . '_' . $masterRecord->course_idnumber;
+
+        if (!OracleRecords[$key]) {
+            // กรณีที่ 4: มีใน Master แต่ไม่มีใน Oracle
+            → UPDATE Master Data (status = 'inactive')
+            → Add to CSV (operation = 'del')
+        }
+    }
+}
+```
+
+---
+
+## 💻 Core Implementation
+
+### 1. Config/Database.php
+
+```php
+<?php
+namespace Config;
+
+use CodeIgniter\Database\Config;
+
+class Database extends Config
+{
+    // Moodle Database (MariaDB)
+    public array $default = [
+        'DSN'      => '',
+        'hostname' => 'localhost',
+        'username' => 'moodle_user',
+        'password' => 'password',
+        'database' => 'moodle',
+        'DBDriver' => 'MySQLi',
+        'DBPrefix' => 'mdl_',
+        'pConnect' => false,
+        'DBDebug'  => true,
+        'charset'  => 'utf8mb4',
+        'DBCollat' => 'utf8mb4_unicode_ci',
+    ];
+
+    // Oracle Database
+    public array $oracle = [
+        'DSN'      => '',
+        'hostname' => 'oracle-server',
+        'username' => 'oracle_user',
+        'password' => 'password',
+        'database' => 'ORCL',
+        'DBDriver' => 'OCI8',
+        'DBPrefix' => '',
+        'pConnect' => false,
+        'DBDebug'  => true,
+        'charset'  => 'AL32UTF8',
+    ];
+}
+```
+
+### 2. Libraries/OracleService.php
+
+```php
+<?php
+namespace App\Libraries;
+
+use Config\Database;
+
+class OracleService
+{
+    protected $db;
+    protected $viewName;
+
+    public function __construct()
+    {
+        $this->db = Database::connect('oracle');
+        $this->viewName = env('oracle.viewName', 'V_STUDENT_ENROLLMENT');
+    }
+
+    /**
+     * ดึงข้อมูลการลงทะเบียนจาก Oracle View
+     */
+    public function getEnrollmentData(string $semester): array
+    {
+        $sql = "
+            SELECT
+                STUDENT_ID as user_idnumber,
+                COURSE_CODE as course_idnumber,
+                SEMESTER as semester,
+                STUDENT_NAME as student_name,
+                COURSE_NAME as course_name,
+                SECTION as section,
+                CREDIT as credit
+            FROM {$this->viewName}
+            WHERE SEMESTER = :semester
+            AND STATUS = 'E'
+            ORDER BY STUDENT_ID, COURSE_CODE
+        ";
+
+        $query = $this->db->query($sql, ['semester' => $semester]);
+        return $query->getResultArray();
+    }
+
+    /**
+     * ตรวจสอบการเชื่อมต่อ
+     */
+    public function testConnection(): bool
+    {
+        try {
+            $query = $this->db->query("SELECT 1 FROM DUAL");
+            return $query !== false;
+        } catch (\Exception $e) {
+            log_message('error', 'Oracle connection failed: ' . $e->getMessage());
+            return false;
+        }
+    }
+}
+```
+
+### 3. Libraries/MoodleEnrolService.php
+
+```php
+<?php
+namespace App\Libraries;
+
+use App\Models\EnrolOracleSyncModel;
+use App\Models\EnrolOracleSyncLogModel;
+use App\Models\EnrolOracleSyncErrorModel;
+
+class MoodleEnrolService
+{
+    protected $syncModel;
+    protected $logModel;
+    protected $errorModel;
+    protected $csvGenerator;
+    protected $oracleService;
+
+    public function __construct()
+    {
+        $this->syncModel = new EnrolOracleSyncModel();
+        $this->logModel = new EnrolOracleSyncLogModel();
+        $this->errorModel = new EnrolOracleSyncErrorModel();
+        $this->csvGenerator = new \App\Libraries\CsvGenerator();
+        $this->oracleService = new \App\Libraries\OracleService();
+    }
+
+    /**
+     * ฟังก์ชันหลักสำหรับ Sync ข้อมูล
+     */
+    public function syncEnrollments(string $semester, string $triggeredBy = 'system'): array
+    {
+        $logId = $this->createSyncLog($semester, $triggeredBy);
+        $startTime = microtime(true);
+
+        try {
+            // 1. ดึงข้อมูลจาก Oracle
+            $oracleData = $this->oracleService->getEnrollmentData($semester);
+
+            if (empty($oracleData)) {
+                throw new \Exception('No data from Oracle for semester: ' . $semester);
+            }
+
+            // 2. ดึงข้อมูล Master Data
+            $masterData = $this->syncModel->where('semester', $semester)->findAll();
+            $masterDataMap = $this->buildDataMap($masterData);
+
+            // 3. เปรียบเทียบและจัดเตรียมข้อมูล
+            $syncResult = $this->compareAndPrepareData(
+                $oracleData,
+                $masterDataMap,
+                $semester
+            );
+
+            // 4. อัพเดท Master Data
+            $this->updateMasterData($syncResult);
+
+            // 5. สร้างไฟล์ CSV
+            $csvPath = $this->csvGenerator->generate(
+                $syncResult['csvData'],
+                $semester
+            );
+
+            // 6. Execute Moodle Flat File Task
+            $this->executeMoodleTask();
+
+            // 7. อัพเดท Log
+            $executionTime = microtime(true) - $startTime;
+            $this->updateSyncLog($logId, $syncResult, $csvPath, $executionTime);
+
+            return [
+                'success' => true,
+                'log_id' => $logId,
+                'stats' => $syncResult['stats'],
+                'execution_time' => $executionTime
+            ];
+
+        } catch (\Exception $e) {
+            $this->logModel->update($logId, [
+                'status' => 'failed',
+                'error_message' => $e->getMessage()
+            ]);
+
+            log_message('error', 'Sync failed: ' . $e->getMessage());
+
+            return [
+                'success' => false,
+                'log_id' => $logId,
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * เปรียบเทียบข้อมูลและจัดเตรียม
+     */
+    protected function compareAndPrepareData(array $oracleData, array $masterMap, string $semester): array
+    {
+        $csvData = [];
+        $toInsert = [];
+        $toUpdate = [];
+        $stats = [
+            'total' => count($oracleData),
+            'new' => 0,
+            'reactivate' => 0,
+            'unchanged' => 0,
+            'removed' => 0
+        ];
+
+        $now = date('Y-m-d H:i:s');
+
+        // ตรวจสอบรายการใน Oracle
+        foreach ($oracleData as $record) {
+            $key = $record['user_idnumber'] . '_' . $record['course_idnumber'];
+
+            if (!isset($masterMap[$key])) {
+                // กรณีที่ 1: รายการใหม่
+                $toInsert[] = array_merge($record, [
+                    'status' => 'active',
+                    'first_sync_date' => $now,
+                    'last_sync_date' => $now,
+                    'last_action' => 'add',
+                    'sync_count' => 1
+                ]);
+
+                $csvData[] = [
+                    'operation' => 'add',
+                    'role' => 'student',
+                    'user_idnumber' => $record['user_idnumber'],
+                    'course_idnumber' => $record['course_idnumber']
+                ];
+
+                $stats['new']++;
+
+            } elseif ($masterMap[$key]['status'] === 'inactive') {
+                // กรณีที่ 2: Reactivate
+                $toUpdate[] = [
+                    'id' => $masterMap[$key]['id'],
+                    'status' => 'active',
+                    'last_sync_date' => $now,
+                    'last_action' => 'add',
+                    'sync_count' => $masterMap[$key]['sync_count'] + 1
+                ];
+
+                $csvData[] = [
+                    'operation' => 'add',
+                    'role' => 'student',
+                    'user_idnumber' => $record['user_idnumber'],
+                    'course_idnumber' => $record['course_idnumber']
+                ];
+
+                $stats['reactivate']++;
+
+            } else {
+                // กรณีที่ 3: ไม่เปลี่ยนแปลง
+                $toUpdate[] = [
+                    'id' => $masterMap[$key]['id'],
+                    'last_sync_date' => $now,
+                    'sync_count' => $masterMap[$key]['sync_count'] + 1
+                ];
+
+                $stats['unchanged']++;
+            }
+
+            unset($masterMap[$key]); // ลบออกจาก map
+        }
+
+        // ตรวจสอบรายการที่เหลือใน Master (ถูกถอน)
+        foreach ($masterMap as $key => $record) {
+            if ($record['status'] === 'active') {
+                $toUpdate[] = [
+                    'id' => $record['id'],
+                    'status' => 'inactive',
+                    'last_sync_date' => $now,
+                    'last_action' => 'del'
+                ];
+
+                $csvData[] = [
+                    'operation' => 'del',
+                    'role' => 'student',
+                    'user_idnumber' => $record['user_idnumber'],
+                    'course_idnumber' => $record['course_idnumber']
+                ];
+
+                $stats['removed']++;
+            }
+        }
+
+        return [
+            'toInsert' => $toInsert,
+            'toUpdate' => $toUpdate,
+            'csvData' => $csvData,
+            'stats' => $stats
+        ];
+    }
+
+    /**
+     * อัพเดท Master Data
+     */
+    protected function updateMasterData(array $syncResult): void
+    {
+        $db = \Config\Database::connect();
+        $db->transStart();
+
+        try {
+            // Insert ข้อมูลใหม่
+            if (!empty($syncResult['toInsert'])) {
+                $this->syncModel->insertBatch($syncResult['toInsert']);
+            }
+
+            // Update ข้อมูลเดิม
+            if (!empty($syncResult['toUpdate'])) {
+                $this->syncModel->updateBatch($syncResult['toUpdate'], 'id');
+            }
+
+            $db->transComplete();
+
+            if ($db->transStatus() === false) {
+                throw new \Exception('Transaction failed');
+            }
+
+        } catch (\Exception $e) {
+            $db->transRollback();
+            throw $e;
+        }
+    }
+
+    /**
+     * Execute Moodle Flat File Task
+     */
+    protected function executeMoodleTask(): bool
+    {
+        $command = "php74 /path/to/moodle/admin/cli/scheduled_task.php --execute='\enrol_flatfile\task\flatfile_sync_task' 2>&1";
+
+        exec($command, $output, $returnVar);
+
+        log_message('info', 'Moodle task executed: ' . implode("\n", $output));
+
+        return $returnVar === 0;
+    }
+
+    /**
+     * สร้าง Data Map
+     */
+    protected function buildDataMap(array $data): array
+    {
+        $map = [];
+        foreach ($data as $record) {
+            $key = $record['user_idnumber'] . '_' . $record['course_idnumber'];
+            $map[$key] = $record;
+        }
+        return $map;
+    }
+
+    /**
+     * สร้าง Sync Log
+     */
+    protected function createSyncLog(string $semester, string $triggeredBy): int
+    {
+        return $this->logModel->insert([
+            'sync_datetime' => date('Y-m-d H:i:s'),
+            'sync_type' => ($triggeredBy === 'system') ? 'scheduled' : 'manual',
+            'semester' => $semester,
+            'status' => 'running',
+            'triggered_by' => $triggeredBy
+        ]);
+    }
+
+    /**
+     * อัพเดท Sync Log
+     */
+    protected function updateSyncLog(int $logId, array $syncResult, string $csvPath, float $executionTime): void
+    {
+        $this->logModel->update($logId, [
+            'total_records' => $syncResult['stats']['total'],
+            'new_enrolls' => $syncResult['stats']['new'] + $syncResult['stats']['reactivate'],
+            'removed_enrolls' => $syncResult['stats']['removed'],
+            'unchanged' => $syncResult['stats']['unchanged'],
+            'execution_time' => round($executionTime, 2),
+            'csv_file_path' => $csvPath,
+            'csv_file_size' => file_exists($csvPath) ? filesize($csvPath) : 0,
+            'status' => 'completed'
+        ]);
+    }
+}
+```
+
+### 4. Libraries/CsvGenerator.php
+
+```php
+<?php
+namespace App\Libraries;
+
+class CsvGenerator
+{
+    protected $csvPath;
+
+    public function __construct()
+    {
+        $this->csvPath = env('csv.filePath', '/VolFreenas/wbsc2021/moodledata/enroll_files/sync-data.csv');
+    }
+
+    /**
+     * สร้างไฟล์ CSV
+     */
+    public function generate(array $data, string $semester): string
+    {
+        // สร้าง backup ของไฟล์เดิม
+        if (file_exists($this->csvPath)) {
+            $backupPath = str_replace('.csv', '_' . date('YmdHis') . '.csv', $this->csvPath);
+            copy($this->csvPath, $backupPath);
+        }
+
+        // สร้างไฟล์ใหม่
+        $fp = fopen($this->csvPath, 'w');
+
+        if (!$fp) {
+            throw new \Exception('Cannot create CSV file: ' . $this->csvPath);
+        }
+
+        // เขียน Header (ถ้าต้องการ - แต่ Moodle flat file ไม่ต้องการ header)
+        // fputcsv($fp, ['operation', 'role', 'user', 'course']);
+
+        // เขียนข้อมูล
+        foreach ($data as $row) {
+            fputcsv($fp, [
+                $row['operation'],
+                $row['role'],
+                $row['user_idnumber'],
+                $row['course_idnumber']
+            ]);
+        }
+
+        fclose($fp);
+
+        // Validate ไฟล์
+        if (!file_exists($this->csvPath)) {
+            throw new \Exception('CSV file not created');
+        }
+
+        log_message('info', 'CSV generated: ' . $this->csvPath . ' (' . count($data) . ' records)');
+
+        return $this->csvPath;
+    }
+
+    /**
+     * อ่านไฟล์ CSV
+     */
+    public function read(): array
+    {
+        if (!file_exists($this->csvPath)) {
+            return [];
+        }
+
+        $data = [];
+        $fp = fopen($this->csvPath, 'r');
+
+        while (($row = fgetcsv($fp)) !== false) {
+            $data[] = [
+                'operation' => $row[0],
+                'role' => $row[1],
+                'user_idnumber' => $row[2],
+                'course_idnumber' => $row[3]
+            ];
+        }
+
+        fclose($fp);
+        return $data;
+    }
+}
+```
+
+### 5. Controllers/Admin/SyncController.php
+
+```php
+<?php
+namespace App\Controllers\Admin;
+
+use App\Controllers\BaseController;
+use App\Libraries\MoodleEnrolService;
+use App\Models\EnrolOracleSyncLogModel;
+use App\Models\EnrolOracleSyncConfigModel;
+
+class SyncController extends BaseController
+{
+    protected $moodleService;
+    protected $logModel;
+    protected $configModel;
+
+    public function __construct()
+    {
+        $this->moodleService = new MoodleEnrolService();
+        $this->logModel = new EnrolOracleSyncLogModel();
+        $this->configModel = new EnrolOracleSyncConfigModel();
+    }
+
+    /**
+     * หน้าแรก - Dashboard
+     */
+    public function index()
+    {
+        $data = [
+            'title' => 'Moodle Enrollment Sync Manager',
+            'currentSemester' => $this->configModel->getValue('current_semester'),
+            'lastSync' => $this->logModel->orderBy('sync_datetime', 'DESC')->first(),
+            'recentLogs' => $this->logModel->orderBy('sync_datetime', 'DESC')->limit(10)->findAll(),
+            'stats' => $this->getStats()
+        ];
+
+        return view('admin/sync/index', $data);
+    }
+
+    /**
+     * Manual Sync
+     */
+    public function manualSync()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back();
+        }
+
+        $semester = $this->request->getPost('semester')
+                    ?? $this->configModel->getValue('current_semester');
+
+        $result = $this->moodleService->syncEnrollments(
+            $semester,
+            session()->get('username') ?? 'admin'
+        );
+
+        return $this->response->setJSON($result);
+    }
+
+    /**
+     * ดูประวัติการ Sync
+     */
+    public function history()
+    {
+        $data = [
+            'title' => 'Sync History',
+            'logs' => $this->logModel
+                ->orderBy('sync_datetime', 'DESC')
+                ->paginate(20),
+            'pager' => $this->logModel->pager
+        ];
+
+        return view('admin/sync/history', $data);
+    }
+
+    /**
+     * ดูรายละเอียด Log
+     */
+    public function viewLog($logId)
+    {
+        $log = $this->logModel->find($logId);
+
+        if (!$log) {
+            return redirect()->to('/admin/sync/history')
+                ->with('error', 'Log not found');
+        }
+
+        $data = [
+            'title' => 'Sync Log Details',
+            'log' => $log,
+            'errors' => $this->logModel->getErrors($logId)
+        ];
+
+        return view('admin/sync/log_detail', $data);
+    }
+
+    /**
+     * ดาวน์โหลด CSV
+     */
+    public function downloadCsv($logId)
+    {
+        $log = $this->logModel->find($logId);
+
+        if (!$log || !file_exists($log['csv_file_path'])) {
+            return redirect()->back()->with('error', 'CSV file not found');
+        }
+
+        return $this->response->download($log['csv_file_path'], null);
+    }
+
+    /**
+     * สถิติ
+     */
+    protected function getStats(): array
+    {
+        $db = \Config\Database::connect();
+
+        return [
+            'total_active' => $db->table('mdl_enrol_oracle_sync')
+                ->where('status', 'active')
+                ->countAllResults(),
+            'total_inactive' => $db->table('mdl_enrol_oracle_sync')
+                ->where('status', 'inactive')
+                ->countAllResults(),
+            'today_syncs' => $db->table('mdl_enrol_oracle_sync_log')
+                ->where('DATE(sync_datetime)', date('Y-m-d'))
+                ->countAllResults(),
+            'failed_syncs' => $db->table('mdl_enrol_oracle_sync_log')
+                ->where('status', 'failed')
+                ->where('DATE(sync_datetime)', date('Y-m-d'))
+                ->countAllResults()
+        ];
+    }
+}
+```
+
+### 6. Commands/SyncEnrolment.php (CLI)
+
+```php
+<?php
+namespace App\Commands;
+
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+use App\Libraries\MoodleEnrolService;
+use App\Models\EnrolOracleSyncConfigModel;
+
+class SyncEnrolment extends BaseCommand
+{
+    protected $group = 'Moodle';
+    protected $name = 'moodle:sync';
+    protected $description = 'Sync enrollment data from Oracle to Moodle';
+
+    protected $usage = 'moodle:sync [semester]';
+    protected $arguments = [
+        'semester' => 'Semester to sync (optional, uses current from config)'
+    ];
+
+    public function run(array $params)
+    {
+        CLI::write('Starting Moodle Enrollment Sync...', 'yellow');
+
+        $configModel = new EnrolOracleSyncConfigModel();
+        $semester = $params[0] ?? $configModel->getValue('current_semester');
+
+        CLI::write('Semester: ' . $semester, 'green');
+
+        $service = new MoodleEnrolService();
+        $result = $service->syncEnrollments($semester, 'cli');
+
+        if ($result['success']) {
+            CLI::write('Sync completed successfully!', 'green');
+            CLI::write('Statistics:', 'yellow');
+            CLI::write('  - Total records: ' . $result['stats']['total']);
+            CLI::write('  - New enrolls: ' . $result['stats']['new']);
+            CLI::write('  - Reactivated: ' . $result['stats']['reactivate']);
+            CLI::write('  - Removed: ' . $result['stats']['removed']);
+            CLI::write('  - Unchanged: ' . $result['stats']['unchanged']);
+            CLI::write('  - Execution time: ' . $result['execution_time'] . 's');
+        } else {
+            CLI::error('Sync failed: ' . $result['error']);
+        }
+    }
+}
+```
+
+---
+
+## 🖥️ Frontend Views (ตัวอย่าง)
+
+### Views/admin/sync/index.php
+
+```php
+<!DOCTYPE html>
+<html>
+<head>
+    <title><?= $title ?></title>
+    <link rel="stylesheet" href="<?= base_url('assets/css/admin.css') ?>">
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Moodle Enrollment Sync Manager</h1>
+
+        <!-- Stats Cards -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Active Enrollments</h3>
+                <p class="stat-number"><?= number_format($stats['total_active']) ?></p>
+            </div>
+            <div class="stat-card">
+                <h3>Inactive Enrollments</h3>
+                <p class="stat-number"><?= number_format($stats['total_inactive']) ?></p>
+            </div>
+            <div class="stat-card">
+                <h3>Today's Syncs</h3>
+                <p class="stat-number"><?= $stats['today_syncs'] ?></p>
+            </div>
+            <div class="stat-card <?= $stats['failed_syncs'] > 0 ? 'error' : '' ?>">
+                <h3>Failed Syncs</h3>
+                <p class="stat-number"><?= $stats['failed_syncs'] ?></p>
+            </div>
+        </div>
+
+        <!-- Manual Sync Section -->
+        <div class="sync-section">
+            <h2>🔄 Manual Sync</h2>
+            <form id="manualSyncForm">
+                <div class="form-group">
+                    <label>Semester:</label>
+                    <input type="text" name="semester" value="<?= $currentSemester ?>" required>
+                </div>
+                <button type="submit" class="btn-primary" id="syncBtn">
+                    Start Sync
+                </button>
+            </form>
+
+            <div id="syncProgress" style="display: none;">
+                <div class="progress-bar">
+                    <div class="progress-fill"></div>
+                </div>
+                <p class="progress-text">Syncing...</p>
+            </div>
+
+            <div id="syncResult" style="display: none;"></div>
+        </div>
+
+        <!-- Last Sync Info -->
+        <?php if ($lastSync): ?>
+        <div class="last-sync-info">
+            <h3>📅 Last Sync</h3>
+            <p><strong>Date:</strong> <?= date('d/m/Y H:i:s', strtotime($lastSync['sync_datetime'])) ?></p>
+            <p><strong>Semester:</strong> <?= $lastSync['semester'] ?></p>
+            <p><strong>Status:</strong>
+                <span class="badge badge-<?= $lastSync['status'] ?>">
+                    <?= ucfirst($lastSync['status']) ?>
+                </span>
+            </p>
+            <p><strong>Records:</strong> <?= number_format($lastSync['total_records']) ?></p>
+            <p><strong>New:</strong> <?= $lastSync['new_enrolls'] ?> |
+               <strong>Removed:</strong> <?= $lastSync['removed_enrolls'] ?></p>
+        </div>
+        <?php endif; ?>
+
+        <!-- Recent Logs -->
+        <div class="recent-logs">
+            <h3>📋 Recent Sync History</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date/Time</th>
+                        <th>Semester</th>
+                        <th>Type</th>
+                        <th>Status</th>
+                        <th>Records</th>
+                        <th>Duration</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($recentLogs as $log): ?>
+                    <tr>
+                        <td><?= date('d/m/Y H:i', strtotime($log['sync_datetime'])) ?></td>
+                        <td><?= $log['semester'] ?></td>
+                        <td><?= ucfirst($log['sync_type']) ?></td>
+                        <td>
+                            <span class="badge badge-<?= $log['status'] ?>">
+                                <?= ucfirst($log['status']) ?>
+                            </span>
+                        </td>
+                        <td><?= number_format($log['total_records']) ?></td>
+                        <td><?= $log['execution_time'] ?>s</td>
+                        <td>
+                            <a href="<?= base_url('admin/sync/log/' . $log['id']) ?>"
+                               class="btn-small">View</a>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+
+            <a href="<?= base_url('admin/sync/history') ?>" class="btn-link">
+                View All History →
+            </a>
+        </div>
+    </div>
+
+    <script src="<?= base_url('assets/js/sync-manager.js') ?>"></script>
+</body>
+</html>
+```
+
+### Public/assets/js/sync-manager.js
+
+```javascript
+document.addEventListener('DOMContentLoaded', function() {
+    const form = document.getElementById('manualSyncForm');
+    const progress = document.getElementById('syncProgress');
+    const result = document.getElementById('syncResult');
+    const syncBtn = document.getElementById('syncBtn');
+
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+
+        // Disable button
+        syncBtn.disabled = true;
+        syncBtn.textContent = 'Syncing...';
+
+        // Show progress
+        progress.style.display = 'block';
+        result.style.display = 'none';
+
+        const formData = new FormData(form);
+
+        try {
+            const response = await fetch('/admin/sync/manual', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+
+            // Hide progress
+            progress.style.display = 'none';
+            result.style.display = 'block';
+
+            if (data.success) {
+                result.className = 'alert alert-success';
+                result.innerHTML = `
+                    <h4>✅ Sync Completed Successfully!</h4>
+                    <ul>
+                        <li>Total Records: ${data.stats.total}</li>
+                        <li>New Enrolls: ${data.stats.new}</li>
+                        <li>Reactivated: ${data.stats.reactivate}</li>
+                        <li>Removed: ${data.stats.removed}</li>
+                        <li>Unchanged: ${data.stats.unchanged}</li>
+                        <li>Execution Time: ${data.execution_time.toFixed(2)}s</li>
+                    </ul>
+                    <a href="/admin/sync/log/${data.log_id}" class="btn-link">View Details</a>
+                `;
+
+                // Reload page after 3 seconds
+                setTimeout(() => location.reload(), 3000);
+            } else {
+                result.className = 'alert alert-error';
+                result.innerHTML = `
+                    <h4>❌ Sync Failed</h4>
+                    <p>${data.error}</p>
+                `;
+            }
+
+        } catch (error) {
+            progress.style.display = 'none';
+            result.style.display = 'block';
+            result.className = 'alert alert-error';
+            result.innerHTML = `
+                <h4>❌ Error</h4>
+                <p>${error.message}</p>
+            `;
+        } finally {
+            syncBtn.disabled = false;
+            syncBtn.textContent = 'Start Sync';
+        }
+    });
+});
+```
+
+---
+
+## ⚙️ Cron Job Setup
+
+### Linux Crontab
+
+```bash
+# Sync ทุกวันเวลา 02:00 น.
+0 2 * * * cd /path/to/wbsc-app && php spark moodle:sync >> /path/to/logs/sync.log 2>&1
+
+# Sync ทุกชั่วโมง (ถ้าต้องการ)
+0 * * * * cd /path/to/wbsc-app && php spark moodle:sync
+
+# Sync ทุก 30 นาที
+*/30 * * * * cd /path/to/wbsc-app && php spark moodle:sync
+```
+
+---
+
+## 📊 API Endpoints
+
+```
+# Admin Panel
+GET  /admin/sync                    - Dashboard
+GET  /admin/sync/history            - Sync history
+GET  /admin/sync/log/{id}           - Log details
+POST /admin/sync/manual             - Manual sync
+GET  /admin/sync/download-csv/{id}  - Download CSV
+
+# Reports
+GET  /admin/reports/dashboard       - Reports dashboard
+GET  /admin/reports/by-course       - Enrollments by course
+GET  /admin/reports/by-user         - Enrollments by user
+GET  /admin/reports/by-semester     - Enrollments by semester
+
+# Config
+GET  /admin/config                  - Config settings
+POST /admin/config/update           - Update config
+
+# API (for external systems)
+POST /api/v1/sync                   - Trigger sync (API Key required)
+GET  /api/v1/sync/status/{logId}    - Get sync status
+GET  /api/v1/enrollments            - Get enrollment data
+```
+
+---
+
+## 🔒 Security Considerations
+
+1. **Database Security**
+   - ใช้ Prepared Statements ทุกครั้ง
+   - แยก User สำหรับ Read/Write
+   - Encrypt sensitive config
+
+2. **File Security**
+   - ตรวจสอบ File permissions (CSV file)
+   - Validate file path
+   - Backup ไฟล์เก่าก่อนเขียนใหม่
+
+3. **Authentication & Authorization**
+   - ใช้ Middleware สำหรับ Admin Panel
+   - API Key สำหรับ API Endpoints
+   - Session management
+
+4. **Logging**
+   - Log ทุก action
+   - Store sensitive data เฉพาะที่จำเป็น
+   - Rotate logs ตามกำหนด
+
+---
+
+## 🧪 Testing Strategy
+
+### Unit Tests
+
+```php
+// tests/Libraries/MoodleEnrolServiceTest.php
+class MoodleEnrolServiceTest extends CIUnitTestCase
+{
+    public function testCompareAndPrepareData()
+    {
+        $service = new MoodleEnrolService();
+        // Test cases...
+    }
+}
+```
+
+### Integration Tests
+
+```php
+// tests/Integration/SyncFlowTest.php
+class SyncFlowTest extends FeatureTestCase
+{
+    public function testFullSyncFlow()
+    {
+        // Test complete sync process
+    }
+}
+```
+
+---
+
+## 📈 Monitoring & Alerts
+
+### Email Notifications
+
+```php
+// ส่งอีเมลเมื่อ Sync เสร็จสิ้น หรือเกิด Error
+if ($result['success']) {
+    $this->sendSuccessEmail($result);
+} else {
+    $this->sendErrorEmail($result);
+}
+```
+
+### Metrics to Monitor
+
+- Sync success rate
+- Execution time trends
+- Error frequency
+- Data volume changes
+
+---
+
+## 🚀 Deployment Checklist
+
+- [ ] สร้างตาราง Database ทั้งหมด
+- [ ] Config Oracle connection
+- [ ] Config Moodle connection
+- [ ] ตรวจสอบ CSV file path และ permissions
+- [ ] ทดสอบการเชื่อมต่อ Oracle
+- [ ] ทดสอบการสร้าง CSV
+- [ ] ทดสอบ Moodle Flat File Plugin
+- [ ] Setup Cron Job
+- [ ] Config Email notifications
+- [ ] ทดสอบ Manual Sync
+- [ ] ทดสอบ Scheduled Sync
+- [ ] Setup Monitoring
+- [ ] Backup strategy
+
+---
+
+## 📝 Maintenance
+
+### Daily
+- ตรวจสอบ Sync logs
+- Monitor error rate
+
+### Weekly
+- Review performance metrics
+- Clean old logs (older than 90 days)
+
+### Monthly
+- Database optimization
+- Backup verification
+- Security audit
+
+---
+
+## 🆘 Troubleshooting
+
+### ปัญหาที่พบบ่อย
+
+**1. Oracle Connection Failed**
+- ตรวจสอบ TNS configuration
+- ตรวจสอบ credentials
+- ตรวจสอบ network connectivity
+
+**2. CSV File Not Created**
+- ตรวจสอบ file permissions
+- ตรวจสอบ disk space
+- ตรวจสอบ path configuration
+
+**3. Moodle Task Failed**
+- ตรวจสอบ CSV format
+- ตรวจสอบ Moodle logs
+- ตรวจสอบ user/course existence
+
+**4. Sync Takes Too Long**
+- เพิ่ม batch processing
+- Optimize database queries
+- ใช้ indexes
+
+---
+
+## 📚 References
+
+- [CodeIgniter 4 Documentation](https://codeigniter.com/user_guide/)
+- [Moodle Flat File Enrolment](https://docs.moodle.org/en/Flat_file)
+- [Oracle Database PHP Extension](https://www.php.net/manual/en/book.oci8.php)
+- [Best Practices for Database Sync](https://www.example.com)
+
+---
+
+**Version**: 1.0.0
+**Last Updated**: October 2025
+**Author**: WBSC Development Team

@@ -1,0 +1,244 @@
+ผมจะ review code และอธิบายเงื่อนไขการ sync ให้ครับ! 🔍
+
+## 📋 สรุปกลไกการ Sync (Incremental Sync with Hash Detection)
+
+### 🎯 หลักการหลัก: **Hash-based Change Detection**
+
+```php
+// จาก StudentSyncService.php
+protected string $hashColumn = 'RECORD_HASH';
+
+// คำนวณ MD5 hash จาก record ทั้งหมด
+protected function calculateRecordHash(array $record): string
+{
+    unset($record[$this->hashColumn]);  // ลบ hash column ออก
+    ksort($record);                     // เรียงลำดับ key
+
+    // สร้าง string จาก value ทั้งหมด
+    $str = implode('|', array_map(function($v) {
+        return $v === null ? 'NULL' : (string)$v;
+    }, $record));
+
+    return md5($str);  // คืนค่า MD5 hash
+}
+```
+
+---
+
+## 🔑 Composite Key สำหรับจับคู่ Records
+
+```php
+// ใช้ 2 field รวมกันเป็น unique key
+protected function buildRecordMap(array $data): array
+{
+    $map = [];
+    foreach ($data as $row) {
+        $key = $row['COURSE_SHORTNAME'] . '|' . $row['USERNAME'];
+        // ตัวอย่าง: "2568-2-1093518|1234567890123"
+        $map[$key] = $row;
+    }
+    return $map;
+}
+```
+
+**Composite Key = `COURSE_SHORTNAME` + `USERNAME`**
+- ไม่มี Auto-increment ID
+- ใช้รหัสวิชา + username นักศึกษาเป็นตัวระบุเฉพาะ
+
+---
+
+## ⚙️ ขั้นตอนการเปรียบเทียบและตัดสิน Operation
+
+### 1️⃣ **Extract & Build Maps**
+
+```php
+// ดึงข้อมูลจาก MariaDB (Source)
+$sourceData = $this->extractSourceDataByFaculty($facultyId);
+
+// ดึงข้อมูลจาก Oracle (Target)
+$existingData = $this->getExistingDataByFaculty($facultyId);
+
+// สร้าง Map ด้วย composite key
+$sourceMap = $this->buildRecordMap($sourceData);
+// ['2568-2-1093518|1234567890123' => [...record...]]
+
+$existingMap = $this->buildRecordMap($existingData);
+// ['2568-2-1093518|1234567890123' => [...record...]]
+```
+
+### 2️⃣ **Compare & Classify Operations**
+
+```php
+$toInsert = [];   // เพิ่มใหม่
+$toUpdate = [];   // แก้ไข
+$toDelete = [];   // ลบ
+$unchanged = 0;   // ไม่เปลี่ยนแปลง
+
+// เช็ค Source กับ Target
+foreach ($sourceMap as $key => $record) {
+    if (!isset($existingMap[$key])) {
+        // ⭐ เงื่อนไขที่ 1: INSERT
+        // มีใน Source แต่ไม่มีใน Target
+        $toInsert[] = $record;
+    } else {
+        // เงื่อนไขที่ 2 & 3: UPDATE หรือ UNCHANGED
+        // มีทั้ง Source และ Target
+
+        if ($record[$this->hashColumn] !== $existingMap[$key][$this->hashColumn]) {
+            // ⭐ เงื่อนไข 2: UPDATE
+            // Hash ไม่ตรงกัน = ข้อมูลเปลี่ยนแปลง
+            $toUpdate[] = $record;
+        } else {
+            // ⭐ เงื่อนไข 3: UNCHANGED
+            // Hash ตรงกัน = ข้อมูลเหมือนเดิม (ไม่ต้องทำอะไร)
+            $unchanged++;
+        }
+    }
+}
+
+// เช็คว่ามี record ใน Target ที่หายไปจาก Source หรือไม่
+foreach ($existingMap as $key => $record) {
+    if (!isset($sourceMap[$key])) {
+        // ⭐ เงื่อนไขที่ 4: DELETE
+        // มีใน Target แต่ไม่มีใน Source แล้ว
+        $toDelete[] = $record;
+    }
+}
+```
+
+---
+
+## 📊 สรุปเงื่อนไขทั้ง 4 แบบ
+
+| Operation | เงื่อนไข | คำอธิบาย | SQL |
+|-----------|----------|----------|-----|
+| **INSERT** | `!isset($existingMap[$key])` | มีใน Source แต่ไม่มีใน Target<br>(นักศึกษาลงทะเบียนใหม่) | `INSERT INTO ... VALUES (...)` |
+| **UPDATE** | `isset($existingMap[$key])` <br>+ `hash ≠ hash` | มีทั้ง Source และ Target<br>แต่ hash ต่างกัน<br>(ข้อมูลเปลี่ยนแปลง เช่น เปลี่ยนกลุ่ม) | `UPDATE ... SET ... WHERE ...` |
+| **DELETE** | `!isset($sourceMap[$key])` | มีใน Target แต่ไม่มีใน Source<br>(นักศึกษาถอนวิชา) | `DELETE FROM ... WHERE ...` |
+| **UNCHANGED** | `isset($existingMap[$key])` <br>+ `hash = hash` | มีทั้ง Source และ Target<br>และ hash เหมือนกัน<br>(ข้อมูลไม่เปลี่ยน - Skip) | ไม่ทำอะไร |
+
+---
+
+## 🔍 ตัวอย่างการคำนวณ Hash
+
+```php
+// Record ตัวอย่าง
+$record = [
+    'CAT_TYPE' => 'ปกติ',
+    'CAT_FACULTY' => 'คณะวิทยาศาสตร์',
+    'CAT_TERM_ID' => 274,
+    'CAT_TERM' => '2/2568',
+    'COURSE_ID' => 12345,
+    'COURSE_SHORTNAME' => '2568-2-1093518',
+    'COURSE_FULLNAME' => 'การโปรแกรมคอมพิวเตอร์',
+    'USERNAME' => '1234567890123',
+    'IDNUMBER' => '1234567890123',
+    'FIRSTNAME' => 'สมชาย',
+    'LASTNAME' => 'ใจดี',
+    'USERROLE' => 'student',
+    'STUDENT_GROUPS' => 'กลุ่ม 01',
+    'STD_ENROLL_KEY' => 'ENROLL123',
+];
+
+// คำนวณ hash
+// Step 1: ลบ RECORD_HASH (ถ้ามี)
+// Step 2: เรียงลำดับ key ด้วย ksort()
+// Step 3: สร้าง string: "ปกติ|คณะวิทยาศาสตร์|274|2/2568|12345|..."
+// Step 4: MD5 hash = "a1b2c3d4e5f6..."
+
+// ถ้าข้อมูลเปลี่ยน เช่น STUDENT_GROUPS = 'กลุ่ม 02'
+// Hash จะเปลี่ยนทันที! → Trigger UPDATE
+```
+
+---
+
+## 💡 จุดเด่นของวิธีนี้
+
+### ✅ **Advantages**
+
+1. **Efficient** - ไม่ต้องเปรียบเทียบทุก field ทีละตัว
+   - แค่เปรียบเทียบ hash string เดียว (32 characters)
+
+2. **Accurate** - ตรวจจับการเปลี่ยนแปลงได้ละเอียด
+   - ถ้ามี field ใดเปลี่ยน hash จะเปลี่ยนทันที
+
+3. **Fast** - MD5 เร็วมาก (~0.001ms per record)
+
+4. **Incremental** - Sync เฉพาะที่เปลี่ยน
+   - ไม่ TRUNCATE + INSERT ใหม่ทั้งหมด
+
+5. **Faculty-based** - แบ่งโหลดได้
+   - Sync ทีละคณะ ลด memory usage
+
+### ⚠️ **Limitations**
+
+1. **Hash collision** - ทางทฤษฎีมี แต่โอกาสต่ำมาก (~1 in 2^128)
+
+2. **No hash in Oracle** - ไม่เก็บ RECORD_HASH ใน Oracle
+   - คำนวณใหม่ทุกครั้งที่ sync (เพิ่มเวลาประมวลผลเล็กน้อย)
+
+3. **Order sensitive** - ถ้าลำดับ field ใน query เปลี่ยน hash อาจเปลี่ยน
+   - แก้ไขด้วย `ksort()` เรียงลำดับ key เสมอ
+
+---
+
+## 🎯 สรุป Flow การ Sync
+
+```
+1. Select Faculty (CAT_TERM_ID = 274)
+
+2. Extract Source (MariaDB)
+   → SELECT * FROM vw_course_student_detailed WHERE CAT_TERM_ID = 274
+   → คำนวณ hash สำหรับทุก record
+
+3. Extract Target (Oracle)
+   → SELECT * FROM COURSE_STUDENT_DETAILED WHERE CAT_TERM_ID = 274
+   → คำนวณ hash สำหรับทุก record
+
+4. Build Maps
+   → sourceMap['course|username'] = record
+   → existingMap['course|username'] = record
+
+5. Compare & Classify
+   → Loop sourceMap: เช็ค INSERT หรือ UPDATE
+   → Loop existingMap: เช็ค DELETE
+
+6. Execute Operations
+   → Batch INSERT (500 records/batch)
+   → Batch UPDATE (500 records/batch)
+   → Batch DELETE
+
+7. Log Statistics
+   → Total, Inserted, Updated, Deleted, Unchanged
+```
+
+---
+
+## 📌 Field ที่ใช้เปรียบเทียบ (14 fields)
+
+จาก code การคำนวณ hash ใช้ทุก field ยกเว้น `RECORD_HASH`:
+
+```php
+$fields = [
+    'CAT_TYPE',           // ประเภทหมวดหมู่
+    'CAT_FACULTY',        // ชื่อคณะ
+    'CAT_TERM_ID',        // รหัสเทอม (Faculty ID)
+    'CAT_TERM',           // เทอม (2/2568)
+    'COURSE_ID',          // รหัสวิชา (internal)
+    'COURSE_SHORTNAME',   // รหัสวิชา (2568-2-1093518) ★ KEY
+    'COURSE_FULLNAME',    // ชื่อวิชา
+    'USERNAME',           // Username นักศึกษา ★ KEY
+    'IDNUMBER',           // รหัสประจำตัวนักศึกษา
+    'FIRSTNAME',          // ชื่อจริง
+    'LASTNAME',           // นามสกุล
+    'USERROLE',           // บทบาท (student)
+    'STUDENT_GROUPS',     // กลุ่มเรียน
+    'STD_ENROLL_KEY',     // Key การลงทะเบียน
+];
+```
+
+**ถ้า field ใดเปลี่ยน = Hash เปลี่ยน = Trigger UPDATE!**
+
+---
+
+มีคำถามเพิ่มเติมเกี่ยวกับ logic การ sync หรือไม่ครับ? 😊

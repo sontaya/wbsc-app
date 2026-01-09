@@ -1,0 +1,678 @@
+ได้เลยครับ! นี่เป็น idea ที่ดีมากเลย 🎯 มาออกแบบระบบให้เป็นอัตโนมัติกันเลย!
+
+## 🎯 ภาพรวมระบบที่ออกแบบให้
+
+### 📊 Current Workflow (Manual)
+```
+1. Sync MariaDB → Oracle ✅ (มีแล้ว: StudentSyncService)
+2. Query VW_STUDENT_COURSE_COMPARISON (Manual)
+3. Export to CSV (Manual)
+4. Upload to Moodle (Manual)
+```
+
+### 🚀 New Workflow (Automated)
+```
+1. Sync MariaDB → Oracle ✅ (StudentSyncService)
+2. Generate CSV from Comparison View 🆕 (Automated)
+3. Upload CSV to Moodle Flat File Directory 🆕 (Automated)
+4. Trigger Moodle Cron 🆕 (Optional)
+```
+
+---
+
+## 🏗️ Architecture Design
+
+### Module ใหม่: **Student Enrollment CSV Generator**
+
+```
+┌─────────────────────────────────────────────────┐
+│  Admin Dashboard (Web UI)                      │
+│  /admin/student-enrollment-csv                 │
+└────────────┬────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────┐
+│  StudentEnrollmentCsvService                   │
+│  - generateEnrollmentCsv()                     │
+│  - getAddToMoodleRecords()                     │
+│  - getRemoveFromMoodleRecords()                │
+│  - formatMoodleCsvRow()                        │
+└────────────┬────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────┐
+│  Oracle View:                                   │
+│  WBSC.VW_STUDENT_COURSE_COMPARISON             │
+│  WHERE ACTION_REQUIRED = 'ADD_TO_MOODLE'       │
+└────────────┬────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────┐
+│  CSV File Generator                             │
+│  Output: student_enroll_add_YYYYMMDD_HHMMSS.csv│
+│  Format: username,firstname,lastname,email,     │
+│          course1,group1,role1                   │
+└────────────┬────────────────────────────────────┘
+             │
+             ▼
+┌─────────────────────────────────────────────────┐
+│  Upload to Moodle                               │
+│  Path: /moodledata/enroll_files/               │
+│  Method: FTP/SFTP or Shared Folder             │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## 💻 Implementation Code
+
+### 1️⃣ **Service: StudentEnrollmentCsvService.php**
+
+```php
+<?php
+
+namespace App\Services\Sync;
+
+use App\Models\Sync\StudentEnrollmentCsvLogModel;
+use Exception;
+
+/**
+ * Student Enrollment CSV Service
+ * Generate CSV files for Moodle Bulk User Upload
+ */
+class StudentEnrollmentCsvService
+{
+    protected $oracleDb;
+    protected $logModel;
+    protected string $csvOutputPath;
+    protected string $viewName = 'WBSC.VW_STUDENT_COURSE_COMPARISON';
+
+    public function __construct()
+    {
+        $this->oracleDb = \Config\Database::connect('oracle');
+        $this->logModel = new StudentEnrollmentCsvLogModel();
+        $this->csvOutputPath = WRITEPATH . 'uploads/moodle_csv/';
+
+        // Create directory if not exists
+        if (!is_dir($this->csvOutputPath)) {
+            mkdir($this->csvOutputPath, 0755, true);
+        }
+    }
+
+    /**
+     * Generate CSV for ADD_TO_MOODLE records
+     */
+    public function generateAddToCsv(array $options = []): array
+    {
+        $startTime = microtime(true);
+        $logId = $this->createLog('started', 'add');
+
+        try {
+            // Get records
+            $records = $this->getAddToMoodleRecords($options);
+
+            if (empty($records)) {
+                throw new Exception('No records found for ADD_TO_MOODLE');
+            }
+
+            // Generate CSV
+            $filename = 'student_enroll_add_' . date('Ymd_His') . '.csv';
+            $filepath = $this->csvOutputPath . $filename;
+
+            $rowCount = $this->writeCsvFile($filepath, $records, 'add');
+
+            $duration = round(microtime(true) - $startTime, 2);
+
+            $result = [
+                'status' => 'success',
+                'log_id' => $logId,
+                'filename' => $filename,
+                'filepath' => $filepath,
+                'record_count' => $rowCount,
+                'duration_seconds' => $duration,
+                'timestamp' => date('Y-m-d H:i:s'),
+            ];
+
+            $this->updateLog($logId, 'completed', $result);
+
+            log_message('info', sprintf(
+                '[StudentEnrollmentCsv] Generated ADD CSV: %s records in %ss',
+                $rowCount,
+                $duration
+            ));
+
+            return $result;
+
+        } catch (Exception $e) {
+            $duration = round(microtime(true) - $startTime, 2);
+
+            $result = [
+                'status' => 'error',
+                'log_id' => $logId,
+                'error' => $e->getMessage(),
+                'duration_seconds' => $duration,
+            ];
+
+            $this->updateLog($logId, 'failed', $result);
+
+            log_message('error', '[StudentEnrollmentCsv] Generate ADD failed: ' . $e->getMessage());
+
+            return $result;
+        }
+    }
+
+    /**
+     * Generate CSV for REMOVE_FROM_MOODLE records
+     */
+    public function generateRemoveCsv(array $options = []): array
+    {
+        $startTime = microtime(true);
+        $logId = $this->createLog('started', 'remove');
+
+        try {
+            $records = $this->getRemoveFromMoodleRecords($options);
+
+            if (empty($records)) {
+                throw new Exception('No records found for REMOVE_FROM_MOODLE');
+            }
+
+            $filename = 'student_enroll_remove_' . date('Ymd_His') . '.csv';
+            $filepath = $this->csvOutputPath . $filename;
+
+            $rowCount = $this->writeCsvFile($filepath, $records, 'remove');
+
+            $duration = round(microtime(true) - $startTime, 2);
+
+            $result = [
+                'status' => 'success',
+                'log_id' => $logId,
+                'filename' => $filename,
+                'filepath' => $filepath,
+                'record_count' => $rowCount,
+                'duration_seconds' => $duration,
+                'timestamp' => date('Y-m-d H:i:s'),
+            ];
+
+            $this->updateLog($logId, 'completed', $result);
+
+            return $result;
+
+        } catch (Exception $e) {
+            $duration = round(microtime(true) - $startTime, 2);
+
+            $result = [
+                'status' => 'error',
+                'log_id' => $logId,
+                'error' => $e->getMessage(),
+                'duration_seconds' => $duration,
+            ];
+
+            $this->updateLog($logId, 'failed', $result);
+
+            return $result;
+        }
+    }
+
+    /**
+     * Get ADD_TO_MOODLE records
+     */
+    protected function getAddToMoodleRecords(array $options = []): array
+    {
+        $facultyId = $options['faculty_id'] ?? null;
+        $academicYear = $options['academic_year'] ?? '2568';
+        $semester = $options['semester'] ?? '2';
+
+        $sql = "
+            SELECT
+                SC.USERNAME,
+                SC.FIRST_NAME_TH AS FIRSTNAME,
+                SC.LAST_NAME_TH AS LASTNAME,
+                SC.USERNAME || '@mail.dusit.ac.th' AS EMAIL,
+                '{$academicYear}-{$semester}-' || SC.SUB_SHOW AS COURSE1,
+                SC.SECTION_CODE AS GROUP1,
+                'student' AS ROLE1
+            FROM {$this->viewName} SC
+            WHERE SC.ACTION_REQUIRED = 'ADD_TO_MOODLE'
+        ";
+
+        if ($facultyId) {
+            $sql .= " AND SC.CAT_TERM_ID = :faculty_id";
+        }
+
+        $sql .= " ORDER BY SC.FACULTYCODE, SC.SUB_SHOW, SC.STD_CODE";
+
+        if ($facultyId) {
+            $query = $this->oracleDb->query($sql, ['faculty_id' => $facultyId]);
+        } else {
+            $query = $this->oracleDb->query($sql);
+        }
+
+        return $query->getResultArray();
+    }
+
+    /**
+     * Get REMOVE_FROM_MOODLE records
+     */
+    protected function getRemoveFromMoodleRecords(array $options = []): array
+    {
+        $facultyId = $options['faculty_id'] ?? null;
+        $academicYear = $options['academic_year'] ?? '2568';
+        $semester = $options['semester'] ?? '2';
+
+        $sql = "
+            SELECT
+                SC.USERNAME,
+                '{$academicYear}-{$semester}-' || SC.SUB_SHOW AS COURSE1,
+                'student' AS ROLE1
+            FROM {$this->viewName} SC
+            WHERE SC.ACTION_REQUIRED = 'REMOVE_FROM_MOODLE'
+        ";
+
+        if ($facultyId) {
+            $sql .= " AND SC.CAT_TERM_ID = :faculty_id";
+        }
+
+        $sql .= " ORDER BY SC.FACULTYCODE, SC.SUB_SHOW, SC.STD_CODE";
+
+        if ($facultyId) {
+            $query = $this->oracleDb->query($sql, ['faculty_id' => $facultyId]);
+        } else {
+            $query = $this->oracleDb->query($sql);
+        }
+
+        return $query->getResultArray();
+    }
+
+    /**
+     * Write CSV file
+     */
+    protected function writeCsvFile(string $filepath, array $records, string $action): int
+    {
+        $fp = fopen($filepath, 'w');
+
+        if (!$fp) {
+            throw new Exception('Cannot create CSV file: ' . $filepath);
+        }
+
+        // Write BOM for UTF-8
+        fprintf($fp, chr(0xEF) . chr(0xBB) . chr(0xBF));
+
+        $rowCount = 0;
+
+        foreach ($records as $record) {
+            if ($action === 'add') {
+                // Format: username,firstname,lastname,email,course1,group1,role1
+                $row = [
+                    $record['USERNAME'],
+                    $record['FIRSTNAME'],
+                    $record['LASTNAME'],
+                    $record['EMAIL'],
+                    $record['COURSE1'],
+                    $record['GROUP1'],
+                    $record['ROLE1'],
+                ];
+            } else {
+                // Format for remove: username,course1,role1
+                $row = [
+                    $record['USERNAME'],
+                    $record['COURSE1'],
+                    $record['ROLE1'],
+                ];
+            }
+
+            fputcsv($fp, $row);
+            $rowCount++;
+        }
+
+        fclose($fp);
+
+        return $rowCount;
+    }
+
+    /**
+     * Get statistics
+     */
+    public function getStatistics(): array
+    {
+        $sql = "
+            SELECT
+                SC.ACTION_REQUIRED,
+                COUNT(*) AS RECORD_COUNT
+            FROM {$this->viewName} SC
+            WHERE SC.ACTION_REQUIRED IN ('ADD_TO_MOODLE', 'REMOVE_FROM_MOODLE')
+            GROUP BY SC.ACTION_REQUIRED
+        ";
+
+        $result = $this->oracleDb->query($sql);
+        $data = $result->getResultArray();
+
+        $stats = [
+            'add_count' => 0,
+            'remove_count' => 0,
+        ];
+
+        foreach ($data as $row) {
+            if ($row['ACTION_REQUIRED'] === 'ADD_TO_MOODLE') {
+                $stats['add_count'] = $row['RECORD_COUNT'];
+            } elseif ($row['ACTION_REQUIRED'] === 'REMOVE_FROM_MOODLE') {
+                $stats['remove_count'] = $row['RECORD_COUNT'];
+            }
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Create log entry
+     */
+    protected function createLog(string $status, string $action): int
+    {
+        return $this->logModel->insert([
+            'action_type' => $action,
+            'status' => $status,
+            'started_at' => date('Y-m-d H:i:s'),
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
+
+    /**
+     * Update log entry
+     */
+    protected function updateLog(int $logId, string $status, array $result): void
+    {
+        $this->logModel->update($logId, [
+            'status' => $status,
+            'result_data' => json_encode($result),
+            'record_count' => $result['record_count'] ?? 0,
+            'completed_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
+        ]);
+    }
+
+    /**
+     * Get recent logs
+     */
+    public function getRecentLogs(int $limit = 10): array
+    {
+        return $this->logModel
+            ->orderBy('id', 'DESC')
+            ->limit($limit)
+            ->findAll();
+    }
+}
+```
+
+---
+
+### 2️⃣ **Controller: StudentEnrollmentCsvController.php**
+
+```php
+<?php
+
+namespace App\Controllers\Admin;
+
+use App\Controllers\BaseController;
+use App\Services\Sync\StudentEnrollmentCsvService;
+use CodeIgniter\HTTP\ResponseInterface;
+
+/**
+ * Student Enrollment CSV Controller
+ */
+class StudentEnrollmentCsvController extends BaseController
+{
+    protected StudentEnrollmentCsvService $csvService;
+
+    public function __construct()
+    {
+        $this->csvService = new StudentEnrollmentCsvService();
+    }
+
+    /**
+     * Dashboard
+     */
+    public function index(): string
+    {
+        $data = [
+            'title' => 'Student Enrollment CSV Generator',
+            'statistics' => $this->csvService->getStatistics(),
+            'recent_logs' => $this->csvService->getRecentLogs(10),
+        ];
+
+        return view('admin/student_enrollment_csv/index', $data);
+    }
+
+    /**
+     * Generate ADD CSV (AJAX)
+     */
+    public function generateAddCsv(): ResponseInterface
+    {
+        try {
+            $result = $this->csvService->generateAddToCsv();
+
+            if ($result['status'] === 'success') {
+                return $this->response->setJSON([
+                    'success' => true,
+                    'message' => 'CSV generated successfully',
+                    'data' => $result
+                ]);
+            } else {
+                return $this->response->setStatusCode(500)->setJSON([
+                    'success' => false,
+                    'message' => $result['error'] ?? 'Generation failed'
+                ]);
+            }
+
+        } catch (\Exception $e) {
+            return $this->response->setStatusCode(500)->setJSON([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Generate REMOVE CSV (AJAX)
+     */
+    public function generateRemoveCsv(): ResponseInterface
+    {
+        try {
+            $result = $this->csvService->generateRemoveCsv();
+
+            if ($result['status'] === 'success') {
+                return $this->response->setJSON([
+                    'success' => true,
+                    'message' => 'CSV generated successfully',
+                    'data' => $result
+                ]);
+            } else {
+                return $this->response->setStatusCode(500)->setJSON([
+                    'success' => false,
+                    'message' => $result['error'] ?? 'Generation failed'
+                ]);
+            }
+
+        } catch (\Exception $e) {
+            return $this->response->setStatusCode(500)->setJSON([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Download CSV
+     */
+    public function downloadCsv(string $filename): ResponseInterface
+    {
+        $filepath = WRITEPATH . 'uploads/moodle_csv/' . $filename;
+
+        if (!file_exists($filepath)) {
+            return $this->response->setStatusCode(404)->setJSON([
+                'success' => false,
+                'message' => 'File not found'
+            ]);
+        }
+
+        return $this->response->download($filepath, null);
+    }
+
+    /**
+     * Get statistics (AJAX)
+     */
+    public function getStatistics(): ResponseInterface
+    {
+        try {
+            $stats = $this->csvService->getStatistics();
+
+            return $this->response->setJSON([
+                'success' => true,
+                'data' => $stats
+            ]);
+
+        } catch (\Exception $e) {
+            return $this->response->setStatusCode(500)->setJSON([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage()
+            ]);
+        }
+    }
+}
+```
+
+---
+
+### 3️⃣ **Routes.php** (เพิ่ม)
+
+```php
+// Student Enrollment CSV Routes
+$routes->group('admin/student-enrollment-csv', ['namespace' => 'App\Controllers\Admin'], function($routes) {
+
+    // Dashboard
+    $routes->get('/', 'StudentEnrollmentCsvController::index');
+
+    // Generate CSV
+    $routes->post('generate-add-csv', 'StudentEnrollmentCsvController::generateAddCsv');
+    $routes->post('generate-remove-csv', 'StudentEnrollmentCsvController::generateRemoveCsv');
+
+    // Statistics
+    $routes->get('get-statistics', 'StudentEnrollmentCsvController::getStatistics');
+
+    // Download
+    $routes->get('download-csv/(:any)', 'StudentEnrollmentCsvController::downloadCsv/$1');
+});
+```
+
+---
+
+### 4️⃣ **Database Migration**
+
+```php
+<?php
+
+namespace App\Database\Migrations;
+
+use CodeIgniter\Database\Migration;
+
+class CreateStudentEnrollmentCsvLogs extends Migration
+{
+    public function up()
+    {
+        $this->forge->addField([
+            'id' => [
+                'type' => 'INT',
+                'constraint' => 11,
+                'unsigned' => true,
+                'auto_increment' => true,
+            ],
+            'action_type' => [
+                'type' => 'ENUM',
+                'constraint' => ['add', 'remove'],
+                'default' => 'add',
+            ],
+            'status' => [
+                'type' => 'ENUM',
+                'constraint' => ['started', 'completed', 'failed'],
+                'default' => 'started',
+            ],
+            'result_data' => [
+                'type' => 'JSON',
+                'null' => true,
+            ],
+            'record_count' => [
+                'type' => 'INT',
+                'default' => 0,
+            ],
+            'started_at' => [
+                'type' => 'DATETIME',
+                'null' => false,
+            ],
+            'completed_at' => [
+                'type' => 'DATETIME',
+                'null' => true,
+            ],
+            'created_at' => [
+                'type' => 'DATETIME',
+                'null' => true,
+            ],
+            'updated_at' => [
+                'type' => 'DATETIME',
+                'null' => true,
+            ],
+        ]);
+
+        $this->forge->addKey('id', true);
+        $this->forge->addKey('action_type');
+        $this->forge->addKey('status');
+        $this->forge->addKey('completed_at');
+
+        $this->forge->createTable('student_enrollment_csv_logs');
+    }
+
+    public function down()
+    {
+        $this->forge->dropTable('student_enrollment_csv_logs');
+    }
+}
+```
+
+---
+
+## 📊 ตัวอย่าง CSV Output
+
+### **student_enroll_add_20251022_143000.csv**
+```csv
+username,firstname,lastname,email,course1,group1,role1
+u6611022446069,นัฐวุฒิ,พูนโสลส,u6611022446069@mail.dusit.ac.th,2568-2-3574809,N5,student
+u6611056721002,ธีรนัย,เสืออุไร,u6611056721002@mail.dusit.ac.th,2568-2-5073384,A4,student
+u6611056721005,รสิกา,เขตกิจ,u6611056721005@mail.dusit.ac.th,2568-2-5073384,A4,student
+```
+
+### **student_enroll_remove_20251022_143030.csv**
+```csv
+username,course1,role1
+u6611056721999,2568-2-5073999,student
+```
+
+---
+
+## ✅ สรุป Implementation Plan
+
+### Phase 1: Core System (ทำก่อน)
+1. ✅ สร้าง Service: `StudentEnrollmentCsvService.php`
+2. ✅ สร้าง Controller: `StudentEnrollmentCsvController.php`
+3. ✅ สร้าง Migration: `CreateStudentEnrollmentCsvLogs.php`
+4. ✅ สร้าง Model: `StudentEnrollmentCsvLogModel.php`
+5. ✅ เพิ่ม Routes
+6. ✅ สร้าง Dashboard UI
+
+### Phase 2: Automation (ทำทีหลัง)
+1. ⏳ Auto Upload to Moodle Flat File Directory (FTP/SFTP)
+2. ⏳ Trigger Moodle Cron via API
+3. ⏳ Schedule Auto Generate (Daily/Hourly)
+4. ⏳ Email Notification
+
+---
+
+**คำตอบ: ✅ ได้แน่นอนครับ!** ระบบนี้สามารถทำได้และจะช่วยลดงาน manual ลงมาก!
+
+ต้องการให้ช่วยเขียน code ส่วนไหนเป็นพิเศษไหมครับ? 😊

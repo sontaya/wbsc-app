@@ -1,0 +1,418 @@
+# Moodle Enrollment Sync System - Project Summary & Continuation Prompt
+
+## 📋 PROJECT SUMMARY
+
+### Project Overview
+**Project Name**: WBSC Moodle Enrollment Sync System
+**Objective**: ระบบบริหารจัดการการเพิ่มถอนรายวิชาอัตโนมัติระหว่าง Oracle Database (ระบบทะเบียน) กับ Moodle LMS
+**Status**: Design Phase Completed
+
+### Technical Stack
+```yaml
+Environment:
+  - Framework: CodeIgniter 4
+  - PHP Version: 8.3
+  - Web Server: Apache
+  - Database: MariaDB (Moodle) + Oracle 11g (Source)
+  - Container: Docker
+  - Base URL: http://localhost:8083/wbsc-app
+  - Document Root: D:/local-wwwroot
+
+Key Technologies:
+  - Oracle OCI8 Driver
+  - Moodle Flat File CSV Enrolment Plugin
+  - Cron/Scheduled Tasks
+  - RESTful API
+```
+
+### System Architecture
+```
+┌─────────────┐
+│ Oracle 11g  │ (Source: ข้อมูลการลงทะเบียน)
+│   View      │
+└──────┬──────┘
+       │ Pull Data
+       ▼
+┌─────────────────────────────────────┐
+│   CodeIgniter 4 Application         │
+│                                     │
+│  • OracleService (ดึงข้อมูล)        │
+│  • MoodleEnrolService (ประมวลผล)   │
+│  • CsvGenerator (สร้าง CSV)        │
+│  • Admin Dashboard (UI)            │
+└────────┬──────────────┬─────────────┘
+         │              │
+         ▼              ▼
+   ┌──────────┐   ┌──────────┐
+   │ MariaDB  │   │ CSV File │
+   │ Master   │   │ Flat     │
+   │ Data     │   │ File     │
+   └──────────┘   └────┬─────┘
+                       │
+                       ▼
+              ┌────────────────┐
+              │ Moodle LMS     │
+              │ (Enrolment)    │
+              └────────────────┘
+```
+
+### Core Database Tables
+```sql
+1. mdl_enrol_oracle_sync
+   - Master data: การลงทะเบียนทั้งหมด
+   - Status tracking: active/inactive
+   - Audit fields
+
+2. mdl_enrol_oracle_sync_log
+   - Sync history และสถิติ
+   - Execution metrics
+
+3. mdl_enrol_oracle_sync_errors
+   - Error tracking
+   - Troubleshooting data
+
+4. mdl_enrol_oracle_sync_config
+   - System configuration
+   - Runtime settings
+```
+
+### Key Features Implemented
+✅ **Core Sync Engine**
+- Oracle View integration
+- Master data comparison logic
+- CSV generation for Moodle Flat File
+- Transaction management
+- Error handling & logging
+
+✅ **Admin Dashboard**
+- Manual sync trigger
+- Real-time statistics
+- Sync history viewer
+- Log details & CSV download
+
+✅ **Reporting**
+- Overall enrollment status
+- By course reports
+- By user reports
+- By semester reports
+
+✅ **Automation**
+- CLI command: `php spark moodle:sync`
+- Cron job support
+- Scheduled task integration
+
+✅ **Monitoring**
+- Detailed logging
+- Performance metrics
+- Email notifications
+- Error tracking
+
+### File Structure
+```
+wbsc-app/
+├── app/
+│   ├── Config/
+│   │   ├── Database.php (Oracle + Moodle)
+│   │   └── MoodleSync.php
+│   ├── Controllers/Admin/
+│   │   ├── SyncController.php
+│   │   ├── ReportController.php
+│   │   └── ConfigController.php
+│   ├── Models/
+│   │   ├── EnrolOracleSyncModel.php
+│   │   ├── EnrolOracleSyncLogModel.php
+│   │   ├── EnrolOracleSyncErrorModel.php
+│   │   └── EnrolOracleSyncConfigModel.php
+│   ├── Libraries/
+│   │   ├── OracleService.php
+│   │   ├── MoodleEnrolService.php
+│   │   ├── CsvGenerator.php
+│   │   └── NotificationService.php
+│   ├── Commands/
+│   │   └── SyncEnrolment.php
+│   └── Views/admin/
+│       ├── sync/ (Dashboard, History, Logs)
+│       └── reports/ (By Course, User, Semester)
+└── public/assets/
+    ├── css/admin.css
+    └── js/sync-manager.js
+```
+
+### Business Logic Flow
+```
+1. ดึงข้อมูลจาก Oracle View (ภาคการศึกษาปัจจุบัน)
+   ↓
+2. เปรียบเทียบกับ Master Data ใน Moodle DB
+   ↓
+3. ระบุการเปลี่ยนแปลง:
+   • ADD: มีใน Oracle ไม่มีใน Master (หรือ inactive)
+   • DEL: มีใน Master (active) แต่ไม่มีใน Oracle
+   • SKIP: ไม่มีการเปลี่ยนแปลง
+   ↓
+4. อัพเดท Master Data (INSERT/UPDATE)
+   ↓
+5. สร้างไฟล์ CSV สำหรับ Moodle Flat File
+   Format: operation,role,user_idnumber,course_idnumber
+   ↓
+6. Execute Moodle Flat File Task
+   php74 scheduled_task.php --execute='\enrol_flatfile\task\flatfile_sync_task'
+   ↓
+7. บันทึก Log + Statistics + Errors
+```
+
+### Key Configuration
+```ini
+# Oracle Connection
+oracle.hostname = oracle-server
+oracle.viewName = V_STUDENT_ENROLLMENT
+
+# CSV Path
+csv.filePath = /VolFreenas/wbsc2021/moodledata/enroll_files/sync-data.csv
+
+# Moodle Task
+moodle.taskPath = /path/to/moodle/admin/cli/scheduled_task.php
+moodle.phpBin = php74
+
+# Sync Settings
+sync.currentSemester = 1/2568
+sync.batchSize = 1000
+sync.schedule = 0 2 * * * (Daily at 2:00 AM)
+```
+
+### API Endpoints
+```
+Admin Panel:
+GET  /admin/sync                    Dashboard
+POST /admin/sync/manual             Trigger manual sync
+GET  /admin/sync/history            Sync history
+GET  /admin/sync/log/{id}           Log details
+GET  /admin/sync/download-csv/{id}  Download CSV
+
+Reports:
+GET  /admin/reports/dashboard       Reports overview
+GET  /admin/reports/by-course       Enrollment by course
+GET  /admin/reports/by-user         Enrollment by user
+
+Config:
+GET  /admin/config                  Settings page
+POST /admin/config/update           Update settings
+
+API:
+POST /api/v1/sync                   Trigger sync (API Key)
+GET  /api/v1/sync/status/{logId}    Check sync status
+```
+
+---
+
+## 🚀 CONTINUATION PROMPT FOR NEXT SESSION
+
+**Copy and paste this prompt to continue working on this project:**
+
+```
+ฉันกำลังพัฒนาระบบ Moodle Enrollment Sync สำหรับเชื่อมต่อ Oracle Database (ระบบทะเบียน) กับ Moodle LMS
+
+### Project Context:
+- **Project**: wbsc-app
+- **Framework**: CodeIgniter 4 + PHP 8.3 + Apache + MariaDB
+- **Environment**: Docker, URL: http://localhost:8083/wbsc-app
+- **Document Root**: D:/local-wwwroot
+
+### System Overview:
+ระบบทำหน้าที่ดึงข้อมูลการลงทะเบียนจาก Oracle 11g View, เปรียบเทียบกับ Master Data ใน Moodle MariaDB, สร้างไฟล์ CSV และใช้ Moodle Flat File Plugin เพื่อเพิ่มถอนรายวิชาอัตโนมัติ
+
+### สิ่งที่กำลังจะทำ
+   * ให้ดึงขัอมูลจาก MariaDB จากวิว wbsc_lms_2020.vw_course_teacher_detailed ไปใส่ใน Oracle WBSC.COURSE_TEACHER_DETAILED
+   * ลบข้อมูลเก่าก่อนทุกครั้งที่ดึงไปใส่ใน Oracle
+   * สร้างหน้าสำหรับการจัดการมีปุ่มสั่งเริ่มทำงาน
+   * ออกแบบเป็นลักษณะของ Template เพราะจะมีหลายฟังก์ชันต่อไป
+   
+### Key Components Already Designed:
+1. **Database Schema**: 4 ตารางหลัก (mdl_enrol_oracle_sync, *_log, *_errors, *_config)
+2. **Core Libraries**: OracleService, MoodleEnrolService, CsvGenerator, NotificationService
+3. **Controllers**: SyncController, ReportController, ConfigController
+4. **Models**: EnrolOracleSyncModel, EnrolOracleSyncLogModel, EnrolOracleSyncErrorModel, EnrolOracleSyncConfigModel
+5. **CLI Command**: php spark moodle:sync
+6. **Admin UI**: Dashboard, Manual Sync, History, Reports
+
+### Data Flow:
+Oracle View → Pull Data → Compare with Master → Update Master → Generate CSV → Execute Moodle Task → Log Results
+
+### CSV Format for Moodle Flat File:
+```
+operation,role,user_idnumber,course_idnumber
+add,student,67010001,CS101
+del,student,67010002,MA201
+```
+
+### File Path:
+CSV: `/VolFreenas/wbsc2021/moodledata/enroll_files/sync-data.csv`
+
+### Current Status:
+✅ System design completed
+✅ Database schema defined
+✅ Core service logic designed
+✅ Controllers structure planned
+✅ Admin UI mockup created
+
+### What I Need Help With:
+[ระบุสิ่งที่ต้องการความช่วยเหลือ เช่น:]
+- สร้าง Model สำหรับ [ชื่อ Model]
+- เขียน Report Controller สำหรับ [รายงานใด]
+- ออกแบบ API endpoint สำหรับ [ฟังก์ชันใด]
+- แก้ไข bug ที่ [อธิบายปัญหา]
+- ปรับปรุง performance ของ [ส่วนใด]
+- เพิ่มฟีเจอร์ [ฟีเจอร์ใหม่]
+
+### Additional Context:
+[ใส่ข้อมูลเพิ่มเติมตามความจำเป็น]
+
+ช่วย[ระบุงานที่ต้องการ]โดยคำนึงถึง:
+1. ใช้ CodeIgniter 4 best practices
+2. มี error handling ที่รอบคอบ
+3. มี logging และ audit trail
+4. Performance optimization (batch processing, indexes)
+5. Security (prepared statements, input validation)
+6. Code ต้อง maintainable และ testable
+```
+
+---
+
+## 📝 QUICK REFERENCE SNIPPETS
+
+### For Database Work:
+```
+ฉันต้องการ [create/modify/query] ตาราง mdl_enrol_oracle_sync_[table_name]
+โดย [อธิบายความต้องการ]
+ใช้ MariaDB syntax และ CodeIgniter 4 Query Builder
+```
+
+### For Controller Development:
+```
+ช่วยสร้าง [Controller Name] ที่มีฟังก์ชัน:
+1. [function name] - [description]
+2. [function name] - [description]
+
+ใช้ CodeIgniter 4 controller pattern พร้อม:
+- Request validation
+- Error handling
+- Response formatting (JSON/View)
+```
+
+### For Service/Library:
+```
+ช่วยเขียน [Service/Library Name] ที่ทำหน้าที่:
+- [responsibility 1]
+- [responsibility 2]
+
+ต้องการ method:
+1. [method name]($params): [return type]
+2. [method name]($params): [return type]
+
+พร้อม error handling และ logging
+```
+
+### For Frontend/View:
+```
+ช่วยสร้าง View สำหรับ [page name] ที่แสดง:
+- [element 1]
+- [element 2]
+
+ใช้ HTML + CSS + JavaScript
+มี AJAX สำหรับ [action]
+แสดงผลแบบ responsive
+```
+
+### For Testing:
+```
+ช่วยเขียน [Unit/Integration] Test สำหรับ:
+- Class: [class name]
+- Method: [method name]
+- Test cases: [list cases]
+
+ใช้ PHPUnit + CodeIgniter 4 testing framework
+```
+
+### For Debugging:
+```
+เจอปัญหา [อธิบายปัญหา]
+ใน [file/class/method name]
+
+Error message: [error text]
+
+Code ที่เกี่ยวข้อง:
+[paste code]
+
+ช่วยวิเคราะห์และแนะนำวิธีแก้ไข
+```
+
+---
+
+## 🎯 IMPLEMENTATION PHASES (For Reference)
+
+### Phase 1: Core Setup (Week 1)
+- [ ] สร้าง Database tables
+- [ ] Config Oracle + Moodle connections
+- [ ] สร้าง Base Models
+- [ ] ทดสอบ connections
+
+### Phase 2: Core Services (Week 2)
+- [ ] OracleService implementation
+- [ ] MoodleEnrolService implementation
+- [ ] CsvGenerator implementation
+- [ ] Unit tests
+
+### Phase 3: Controllers & Views (Week 3)
+- [ ] SyncController + Views
+- [ ] ReportController + Views
+- [ ] ConfigController + Views
+- [ ] Frontend JavaScript
+
+### Phase 4: Testing & Refinement (Week 4)
+- [ ] Integration testing
+- [ ] Performance optimization
+- [ ] Security audit
+- [ ] Documentation
+
+### Phase 5: Deployment (Week 5)
+- [ ] Cron job setup
+- [ ] Email notifications
+- [ ] Monitoring setup
+- [ ] Production deployment
+
+---
+
+## 📚 IMPORTANT LINKS & REFERENCES
+
+### Documentation
+- CodeIgniter 4: https://codeigniter.com/user_guide/
+- Oracle OCI8: https://www.php.net/manual/en/book.oci8.php
+- Moodle Flat File: https://docs.moodle.org/en/Flat_file
+
+### Key Files to Reference
+1. Full System Design: [Artifact from previous session]
+2. Database Schema: Tables with indexes and relationships
+3. Service Logic: MoodleEnrolService sync algorithm
+4. CSV Format: Moodle Flat File specification
+
+### Common Issues & Solutions
+1. **Oracle Connection**: Check TNS_ADMIN, verify credentials
+2. **CSV Not Working**: Validate format, check file permissions
+3. **Sync Performance**: Use batch processing, add indexes
+4. **Transaction Failures**: Check FK constraints, deadlocks
+
+---
+
+## 💡 TIPS FOR CONTINUATION
+
+1. **Always specify context**: ระบุว่ากำลังทำงานในส่วนไหนของระบบ
+2. **Reference existing design**: อ้างอิง design ที่ทำไว้แล้ว
+3. **Be specific**: บอกชื่อ file, class, method ที่ชัดเจน
+4. **Include code context**: แปะ code ที่เกี่ยวข้องมาด้วย
+5. **State requirements**: บอกข้อกำหนดพิเศษ (performance, security, etc.)
+
+---
+
+**Document Version**: 1.0
+**Last Updated**: October 2025
+**Status**: Ready for Implementation
+**Estimated Timeline**: 5 weeks
