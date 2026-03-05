@@ -26,10 +26,10 @@ class Database extends Config
      */
     public array $default = [
         'DSN'      => '',
-        'hostname' => '10.129.37.85',
-        'username' => 'root',
-        'password' => 'm@ri@DB',
-        'database' => 'wbsc_lms_2020',
+        'hostname' => '',
+        'username' => '',
+        'password' => '',
+        'database' => '',
         'DBDriver' => 'MySQLi',
         'DBPrefix' => '',
         'pConnect' => false,
@@ -46,10 +46,10 @@ class Database extends Config
 
     public array $oracle = [
         'DSN'      => '',
-        'hostname' => '10.202.1.30',
-        'username' => 'WBSC',
-        'password' => 'wbsc@sdu',
-        'database' => 'EDUPRD',
+        'hostname' => '',
+        'username' => '',
+        'password' => '',
+        'database' => '',
         'DBDriver' => 'OCI8',
         'DBPrefix' => '',
         'pConnect' => false,
