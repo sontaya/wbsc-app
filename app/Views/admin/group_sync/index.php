@@ -15,6 +15,8 @@
     </style>
 </head>
 <body>
+<?= view('admin/_menu') ?>
+
 <h1><?= esc($title ?? 'Group Sync') ?></h1>
 <ul>
     <li><code>GET /admin/group-sync/preview</code></li>

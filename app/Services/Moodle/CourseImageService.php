@@ -26,22 +26,25 @@ class CourseImageService extends BaseAutomationService
 
     public function bulkUpdateImagesViaApi(array $courseIds, string $imagePath): array
     {
-        $updated = 0;
-        $errors = [];
+        if (!file_exists($imagePath)) {
+            throw new Exception('Image file not found: ' . $imagePath);
+        }
 
-        foreach ($courseIds as $courseId) {
-            try {
-                $this->updateCourseImageViaApi((int) $courseId, $imagePath);
-                $updated++;
-            } catch (Exception $e) {
-                $errors[] = 'Course ' . $courseId . ': ' . $e->getMessage();
-            }
+        $count = count($courseIds);
+        if ($count === 0) {
+            return [
+                'updated' => 0,
+                'failed' => 0,
+                'errors' => ['No target course IDs were found.'],
+            ];
         }
 
         return [
-            'updated' => $updated,
-            'failed' => count($courseIds) - $updated,
-            'errors' => $errors,
+            'updated' => 0,
+            'failed' => $count,
+            'errors' => [
+                'Moodle 3.11 does not provide a core REST endpoint to update course overview image files via token webservice. Use SSH mode.',
+            ],
         ];
     }
 

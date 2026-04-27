@@ -23,6 +23,8 @@
     </style>
 </head>
 <body>
+<?= view('admin/_menu') ?>
+
 <h1><?= esc($title ?? 'Enroll Auto Import') ?></h1>
 <p>Use API endpoints for automation:</p>
 <ul>

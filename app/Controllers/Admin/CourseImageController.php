@@ -106,6 +106,11 @@ class CourseImageController extends BaseController
                 ]);
             }
 
+            $isFailure = (($result['updated'] ?? 0) === 0) && (($result['failed'] ?? 0) > 0);
+            if ($isFailure) {
+                return $this->response->setStatusCode(422)->setJSON(['success' => false, 'data' => $result]);
+            }
+
             return $this->response->setJSON(['success' => true, 'data' => $result]);
         } catch (\Throwable $e) {
             return $this->response->setStatusCode(500)->setJSON(['success' => false, 'message' => $e->getMessage()]);

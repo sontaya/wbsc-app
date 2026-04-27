@@ -130,6 +130,8 @@
     </style>
 </head>
 <body>
+    <?= view('admin/_menu') ?>
+
     <!-- Header -->
     <div class="page-header">
         <div class="container">

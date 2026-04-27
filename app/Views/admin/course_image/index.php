@@ -18,8 +18,10 @@
     </style>
 </head>
 <body>
+<?= view('admin/_menu') ?>
+
 <h1><?= esc($title ?? 'Course Image Update') ?></h1>
-<p>This endpoint supports API/SSH execution.</p>
+<p>This endpoint supports SSH execution. In Moodle 3.11, API mode cannot update course overview images.</p>
 <ul>
     <li><code>GET /admin/course-image/categories</code></li>
     <li><code>GET /admin/course-image/courses-by-category?category_id=289</code></li>
@@ -34,7 +36,7 @@
         <label for="mode">Mode</label>
         <select id="mode">
             <option value="ssh">ssh</option>
-            <option value="api">api</option>
+            <option value="api" disabled>api (not supported on Moodle 3.11)</option>
         </select>
     </div>
 

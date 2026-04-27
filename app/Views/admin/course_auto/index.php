@@ -20,6 +20,8 @@
     </style>
 </head>
 <body>
+<?= view('admin/_menu') ?>
+
 <h1><?= esc($title ?? 'Course Auto Create') ?></h1>
 <p>Use API endpoints for automation:</p>
 <ul>
