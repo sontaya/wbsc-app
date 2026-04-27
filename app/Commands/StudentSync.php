@@ -22,23 +22,38 @@ class StudentSyncService extends BaseSyncService
     /**
      * Faculty configuration (cat_term_id)
      */
-    protected array $facultyConfig = [
-        271 => 'หมวดวิชาศึกษาทั่วไป (2/2568)',
-        272 => 'คณะครุศาสตร์ (2/2568)',
-        273 => 'คณะมนุษยศาสตร์และสังคมศาสตร์ (2/2568)',
-        274 => 'คณะวิทยาศาสตร์และเทคโนโลยี (2/2568)',
-        275 => 'คณะวิทยาการจัดการ (2/2568)',
-        276 => 'คณะพยาบาลศาสตร์ (2/2568)',
-        277 => 'โรงเรียนการเรือน (2/2568)',
-        278 => 'โรงเรียนการท่องเที่ยวและการบริการ (2/2568)',
-        279 => 'โรงเรียนกฎหมายและการเมือง (2/2568)',
-    ];
+    // protected array $facultyConfig = [
+    //     271 => 'หมวดวิชาศึกษาทั่วไป (2/2568)',
+    //     272 => 'คณะครุศาสตร์ (2/2568)',
+    //     273 => 'คณะมนุษยศาสตร์และสังคมศาสตร์ (2/2568)',
+    //     274 => 'คณะวิทยาศาสตร์และเทคโนโลยี (2/2568)',
+    //     275 => 'คณะวิทยาการจัดการ (2/2568)',
+    //     276 => 'คณะพยาบาลศาสตร์ (2/2568)',
+    //     277 => 'โรงเรียนการเรือน (2/2568)',
+    //     278 => 'โรงเรียนการท่องเที่ยวและการบริการ (2/2568)',
+    //     279 => 'โรงเรียนกฎหมายและการเมือง (2/2568)',
+    // ];
+
+    protected array $facultyConfig = [];
 
     public function __construct()
     {
         parent::__construct();
         $this->logModel = new StudentSyncLogModel();
         $this->config['batch_size'] = 500;
+
+        $facultyConfig = env('wbsc.studentSyncFacultyConfig');
+        if (is_string($facultyConfig) && trim($facultyConfig) !== '') {
+            $decoded = json_decode($facultyConfig, true);
+            if (is_array($decoded)) {
+                $normalized = [];
+                foreach ($decoded as $facultyId => $facultyName) {
+                    $normalized[(int) $facultyId] = (string) $facultyName;
+                }
+
+                $this->facultyConfig = $normalized;
+            }
+        }
     }
 
     protected function getSyncType(): string
@@ -125,7 +140,6 @@ class StudentSyncService extends BaseSyncService
             ));
 
             return $result;
-
         } catch (Exception $e) {
             $duration = round(microtime(true) - $startTime, 2);
 
@@ -295,7 +309,7 @@ class StudentSyncService extends BaseSyncService
     {
         unset($record[$this->hashColumn]);
         ksort($record);
-        $str = implode('|', array_map(function($v) {
+        $str = implode('|', array_map(function ($v) {
             return $v === null ? 'NULL' : (string)$v;
         }, $record));
         return md5($str);
@@ -328,7 +342,6 @@ class StudentSyncService extends BaseSyncService
                 if ($this->targetDb->transStatus() === false) {
                     throw new Exception('Insert transaction failed');
                 }
-
             } catch (Exception $e) {
                 $this->targetDb->transRollback();
                 log_message('error', '[StudentSync] Insert failed: ' . $e->getMessage());
@@ -366,7 +379,6 @@ class StudentSyncService extends BaseSyncService
                 if ($this->targetDb->transStatus() === false) {
                     throw new Exception('Update transaction failed');
                 }
-
             } catch (Exception $e) {
                 $this->targetDb->transRollback();
                 log_message('error', '[StudentSync] Update failed: ' . $e->getMessage());
@@ -402,7 +414,6 @@ class StudentSyncService extends BaseSyncService
             if ($this->targetDb->transStatus() === false) {
                 throw new Exception('Delete transaction failed');
             }
-
         } catch (Exception $e) {
             $this->targetDb->transRollback();
             log_message('error', '[StudentSync] Delete failed: ' . $e->getMessage());
