@@ -13,6 +13,7 @@ class CsvGeneratorService
     protected $oracleDb;
     protected string $csvFilePath;
     protected string $compareView = 'WBSC.COURSE_TEACHER_COMPARE';
+    protected string $excludedStaffIdForAdd = '8888-888';
 
     public function __construct()
     {
@@ -98,6 +99,7 @@ class CsvGeneratorService
             FROM {$this->compareView} TC
             WHERE TC.ACTION = 'Add'
             AND TC.CITIZEN_CODE IS NOT NULL
+            AND NVL(TRIM(TC.STAFF_ID), '') <> '{$this->excludedStaffIdForAdd}'
             ORDER BY TC.COURSE_SHORTNAME, TC.CITIZEN_CODE
         ";
 
@@ -273,6 +275,8 @@ class CsvGeneratorService
                     ACTION,
                     COUNT(*) as count
                 FROM {$this->compareView}
+                WHERE ACTION <> 'Add'
+                   OR NVL(TRIM(STAFF_ID), '') <> '{$this->excludedStaffIdForAdd}'
                 GROUP BY ACTION
             ";
 

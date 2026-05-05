@@ -185,6 +185,12 @@ async function loadTeacherConflicts() {
 
     try {
         const res = await fetch('/admin/enroll-auto/teacher-conflicts');
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            const body = await res.text();
+            throw new Error('Expected JSON but received ' + (contentType || 'unknown content-type') + '. HTTP ' + res.status + '. Body: ' + body.slice(0, 300));
+        }
+
         const data = await res.json();
         if (!data.success) {
             container.textContent = 'Check failed: ' + JSON.stringify(data);
@@ -224,6 +230,12 @@ async function runEnrollAuto(dryRun) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
+
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            const body = await res.text();
+            throw new Error('Expected JSON but received ' + (contentType || 'unknown content-type') + '. HTTP ' + res.status + '. Body: ' + body.slice(0, 300));
+        }
 
         const data = await res.json();
         el.textContent = JSON.stringify(data, null, 2);

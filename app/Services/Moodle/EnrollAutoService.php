@@ -60,6 +60,8 @@ class EnrollAutoService extends BaseAutomationService
     public function getTeachersToAdd(): array
     {
         $view = $this->automationConfig->teacherComparisonView;
+        $termPrefix = trim((string) $this->automationConfig->termPrefix);
+        $termPrefixLike = str_replace("'", "''", $termPrefix) . '%';
         $sql = "
             SELECT
                 NVL(TC.USERNAME, GP.USER_ID) AS USERNAME,
@@ -74,6 +76,7 @@ class EnrollAutoService extends BaseAutomationService
                 ON TC.CITIZEN_CODE = GP.CITIZEN_CODE
             WHERE TC.ACTION = 'Add'
               AND TC.COURSE_SHORTNAME IS NOT NULL
+              AND TC.COURSE_SHORTNAME LIKE '{$termPrefixLike}'
               AND (TC.USERNAME IS NOT NULL OR TC.CITIZEN_CODE IS NOT NULL)
             ORDER BY TC.COURSE_SHORTNAME
         ";
@@ -84,6 +87,8 @@ class EnrollAutoService extends BaseAutomationService
     public function getTeachersToRemove(): array
     {
         $view = $this->automationConfig->teacherComparisonView;
+        $termPrefix = trim((string) $this->automationConfig->termPrefix);
+        $termPrefixLike = str_replace("'", "''", $termPrefix) . '%';
         $sql = "
             SELECT
                 TC.USERNAME,
@@ -93,6 +98,7 @@ class EnrollAutoService extends BaseAutomationService
             FROM {$view} TC
             WHERE TC.ACTION = 'Del'
               AND TC.COURSE_SHORTNAME IS NOT NULL
+              AND TC.COURSE_SHORTNAME LIKE '{$termPrefixLike}'
               AND (TC.USERNAME IS NOT NULL OR TC.CITIZEN_CODE IS NOT NULL)
             ORDER BY TC.COURSE_SHORTNAME
         ";
@@ -408,10 +414,33 @@ class EnrollAutoService extends BaseAutomationService
         }
 
         if ($idnumber !== '') {
-            return $this->moodleApi->findUserByIdnumber($idnumber);
+            $user = $this->findActiveMoodleUserByIdnumber($idnumber);
+            if ($user !== null) {
+                return $user;
+            }
+
+            return null;
         }
 
         return null;
+    }
+
+    protected function findActiveMoodleUserByIdnumber(string $idnumber): ?array
+    {
+        $rows = \Config\Database::connect()
+            ->table('wbbs_user')
+            ->select('id, username, idnumber')
+            ->where('idnumber', $idnumber)
+            ->where('deleted', 0)
+            ->orderBy('id', 'ASC')
+            ->get()
+            ->getResultArray();
+
+        if (count($rows) !== 1) {
+            return null;
+        }
+
+        return $rows[0];
     }
 
     protected function resolveRoleId(string $role): int
@@ -553,6 +582,8 @@ class EnrollAutoService extends BaseAutomationService
     protected function getOracleTeacherCourses(): array
     {
         $view = $this->automationConfig->teacherComparisonView;
+        $termPrefix = trim((string) $this->automationConfig->termPrefix);
+        $termPrefixLike = str_replace("'", "''", $termPrefix) . '%';
 
         $courseSql = "
             SELECT DISTINCT
@@ -560,6 +591,7 @@ class EnrollAutoService extends BaseAutomationService
                 TC.COURSE_FULLNAME
             FROM {$view} TC
             WHERE TC.COURSE_SHORTNAME IS NOT NULL
+              AND TC.COURSE_SHORTNAME LIKE '{$termPrefixLike}'
             ORDER BY TC.COURSE_SHORTNAME
         ";
 
@@ -593,6 +625,7 @@ class EnrollAutoService extends BaseAutomationService
             LEFT JOIN VW_HR_PROFILE@LNK_RSDUE2M_SDPERSON GP
                 ON TC.CITIZEN_CODE = GP.CITIZEN_CODE
             WHERE TC.COURSE_SHORTNAME IS NOT NULL
+              AND TC.COURSE_SHORTNAME LIKE '{$termPrefixLike}'
               AND TC.ACTION IN ('Add', 'Match')
             ORDER BY TC.COURSE_SHORTNAME, FULLNAME
         ";
